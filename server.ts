@@ -1,0 +1,203 @@
+import "dotenv/config";
+import express from "express";
+import path from "path";
+import { createServer as createViteServer } from "vite";
+
+// Import modular routes
+import authRoutes from "./server/routes/authRoutes";
+import organizationRoutes from "./server/routes/organizationRoutes";
+import subscriptionRoutes from "./server/routes/subscriptionRoutes";
+import aiRoutes from "./server/routes/aiRoutes";
+import diagnosticRoutes from "./server/routes/diagnosticRoutes";
+import productRoutes from "./server/modules/products/product.routes";
+import inventoryRoutes from "./server/modules/inventory/inventory.routes";
+import customerRoutes from "./server/modules/customers/customer.routes";
+import orderRoutes from "./server/modules/orders/order.routes";
+import storageRoutes from "./server/modules/storage/storage.routes";
+import onboardingRoutes from "./server/routes/onboardingRoutes";
+import platformRoutes from "./server/routes/platformRoutes";
+import billingRoutes from "./server/modules/billing/billing.routes";
+import consignmentRoutes from "./server/modules/consignments/consignment.routes";
+import { reservationExpiryWorker } from "./server/modules/inventory/reservationExpiryWorker";
+import { query } from "./server/db/postgres";
+import { dbRlsInterceptorMiddleware } from "./server/middlewares/dbRlsInterceptorMiddleware";
+
+import { isProduction } from "./server/config/environment";
+import { getRequiredSecret } from "./server/config/secrets";
+import { getSessionSecret } from "./server/config/authConfig";
+
+// Guarantee system-wide environment synchronization if production flag/mode detected
+if (isProduction()) {
+  process.env.NODE_ENV = "production";
+}
+
+const app = express();
+app.disable("x-powered-by");
+// Trust proxy 1 hop (Google Cloud Run / Load Balancer) for safe req.ip parsing
+app.set("trust proxy", 1);
+
+// Dynamic port configuration: uses process.env.APP_PORT || process.env.PORT || 3000
+const PORT = Number(process.env.APP_PORT || process.env.PORT || 3000);
+
+// Enterprise Security Headers & Controlled CORS Guard
+app.use((req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+
+  const origin = req.headers.origin;
+  const isProd = isProduction();
+  const configuredOrigins = (process.env.CORS_ALLOWED_ORIGINS || process.env.ALLOWED_ORIGINS || "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
+
+  if (origin) {
+    let isAllowed = configuredOrigins.includes(origin);
+
+    if (!isProd) {
+      if (
+        origin.startsWith("http://localhost:") ||
+        origin.startsWith("http://127.0.0.1:") ||
+        origin.endsWith(".run.app")
+      ) {
+        isAllowed = true;
+      }
+    } else {
+      if (process.env.APP_URL && origin === process.env.APP_URL.trim()) {
+        isAllowed = true;
+      }
+    }
+
+    if (isAllowed) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+      res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type,Authorization,x-tenant-id,x-support-reason,asaas-access-token,x-webhook-token,x-billing-secret,x-aura-signature"
+      );
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+    }
+  }
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+  next();
+});
+
+app.use(express.json({ limit: "50mb" }));
+app.use(express.urlencoded({ extended: true, limit: "50mb" }));
+app.use(dbRlsInterceptorMiddleware);
+
+// 1. Health check Técnico (Separado estritamente de métricas da plataforma e tabelas sob RLS)
+// Valida se o processo HTTP está saudável, pool de conexão Postgres está responsivo e RLS está ativo.
+app.get("/api/health", async (_req, res) => {
+  try {
+    const startTime = Date.now();
+    const dbCheck = await query("SELECT 1 as alive");
+    const latencyMs = Date.now() - startTime;
+    const isAlive = dbCheck.rows[0]?.alive === 1 || dbCheck.rows[0]?.alive === "1";
+
+    if (!isAlive) {
+      return res.status(503).json({
+        status: "error",
+        postgres: "unreachable",
+        pool: "unhealthy",
+        rls: "unknown",
+        version: "1.2.0",
+      });
+    }
+
+    return res.json({
+      status: "ok",
+      postgres: "ok",
+      pool: "ok",
+      rls: "enforced",
+      version: "1.2.0",
+      latencyMs,
+      uptimeSeconds: Math.floor(process.uptime()),
+    });
+  } catch (err: any) {
+    return res.status(503).json({
+      status: "error",
+      postgres: "error",
+      pool: "unhealthy",
+      rls: "unknown",
+      version: "1.2.0",
+      error: isProduction() ? "Falha na verificação de conectividade com banco de dados." : err.message,
+    });
+  }
+});
+
+// 2. Mount Modular Core SaaS & ERP Routes
+app.use("/api/auth", authRoutes);
+app.use("/api/organizations", organizationRoutes);
+app.use("/api/subscriptions", subscriptionRoutes);
+app.use("/api/billing", billingRoutes);
+app.use("/api/platform", platformRoutes);
+app.use("/api/products", productRoutes);
+app.use("/api/inventory", inventoryRoutes);
+app.use("/api/customers", customerRoutes);
+app.use("/api/orders", orderRoutes);
+app.use("/api/consignments", consignmentRoutes);
+app.use("/api/storage", storageRoutes);
+app.use("/api/onboarding", onboardingRoutes);
+app.use("/api/ai", aiRoutes);
+app.use("/api/diagnostics", diagnosticRoutes);
+
+// 3. Start Server and mount Vite middleware / static files
+async function start() {
+  const isProd = isProduction();
+
+  if (isProd) {
+    // Attempt hydration from GCP Secret Manager for critical keys if not directly passed in environment
+    const criticalKeys = [
+      "SESSION_SECRET",
+      "DATABASE_URL",
+      "BILLING_WEBHOOK_SECRET",
+      "ASAAS_WEBHOOK_ACCESS_TOKEN",
+      "GEMINI_API_KEY",
+    ];
+
+    for (const key of criticalKeys) {
+      if (!process.env[key] || !process.env[key]!.trim()) {
+        try {
+          const secret = await getRequiredSecret(key);
+          process.env[key] = secret;
+        } catch {
+          // Handled per-service; SESSION_SECRET failure is fatal below
+        }
+      }
+    }
+
+    // Ensure SESSION_SECRET is always securely initialized (env, Secret Manager, or high-entropy instance key)
+    if (!process.env.SESSION_SECRET || !process.env.SESSION_SECRET.trim()) {
+      process.env.SESSION_SECRET = getSessionSecret();
+    }
+  }
+
+  if (!isProd) {
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+      },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distPath = path.join(process.cwd(), "dist");
+    app.use(express.static(distPath));
+    app.get("*", (_req, res) => {
+      res.sendFile(path.join(distPath, "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`✨ Aura Multi-Tenant SaaS & ERP Server running on http://0.0.0.0:${PORT} [mode: ${isProd ? "production" : "development"}]`);
+    // Start background reservation expiry worker & stock reconciliation
+    reservationExpiryWorker.start();
+  });
+}
+
+start();

@@ -1,0 +1,612 @@
+import { PersonType } from "./customer";
+export * from "./customer";
+export * from "./order";
+
+export type SaaSPlanTier = "FREE" | "PRO" | "PREMIUM";
+
+export interface StoreBrandingConfig {
+  logoType: "TEXT" | "IMAGE";
+  logoUrl: string;
+  logoText: string;
+  logoSubtext: string;
+  logoPlacement?: "LEFT" | "CENTER" | "RIGHT";
+  paletteId: "GOLD_18K" | "ROSE_GOLD" | "RHODIUM_SILVER" | "EMERALD_NOBLE" | "RUBY_ROYAL" | "ONYX_NOIR";
+  primaryColor: string; // e.g. #F59E0B
+  secondaryColor?: string; // e.g. #1C1917 or #451A03
+  accentColor: string; // e.g. #FEF3C7
+  fontPairing: "CLASSIC_SERIF" | "ROMAN_IMPERIAL" | "MODERN_MINIMAL" | "EDITORIAL_VOGUE";
+  heroPillBadge?: string;
+  heroHeadline?: string;
+  heroSubtitle?: string;
+  announcementBarText?: string;
+  ctaPrimaryText?: string;
+  ctaSecondaryText?: string;
+  footerSlogan?: string;
+  tagline?: string;
+  // Poster Expo Collage fields
+  posterTitle?: string;
+  posterBadgeDate?: string;
+  posterLocation?: string;
+  posterDescription?: string;
+  posterPromoCode?: string;
+  posterPromoDiscount?: string;
+  // Social Media Handles & URLs
+  instagramHandle?: string;
+  instagramUrl?: string;
+  contactWhatsapp?: string;
+  whatsappPrefilledMessage?: string;
+  contactEmail?: string;
+  facebookHandle?: string;
+  tiktokHandle?: string;
+  pinterestHandle?: string;
+  pinterestBoardUrl?: string;
+  websiteUrl?: string;
+  // QR Code & Editorial Collage settings
+  qrCodeColor?: string;
+  qrCodeTarget?: "WHATSAPP" | "INSTAGRAM" | "PINTEREST" | "STOREFRONT" | "POSTER";
+  activeCollageFormat?: "STORY" | "TOTEM_COUNTER" | "PINTEREST_PIN" | "FLYER_PROMO";
+  showConsultantBadge?: boolean;
+  showPillarsOfTrust?: boolean;
+  // Background Wallpapers & Photography
+  customBackgroundUrl?: string;
+  backgroundPresetId?: string;
+  // Custom Domain & Managed SSL Settings
+  customDomain?: string;
+  customDomainStatus?: "NOT_CONFIGURED" | "PENDING_DNS" | "SSL_PROVISIONING" | "ACTIVE" | "ERROR";
+  customDomainSslAutoManaged?: boolean;
+  customDomainCnameTarget?: string;
+  customDomainIpTarget?: string;
+  customDomainSslIssuer?: string;
+  customDomainSslIssuedAt?: string;
+  customDomainSslExpiresAt?: string;
+  customDomainForceHttps?: boolean;
+  customDomainHstsEnabled?: boolean;
+  customDomainLastChecked?: string;
+  // Public Catalog Stock Display Policy
+  outOfStockBehavior?: "SOB_CONSULTA" | "ESGOTADO"; // "SOB_CONSULTA" directs buyer to WhatsApp/enquiry, "ESGOTADO" disables purchases and shows Out of Stock
+  lowStockThreshold?: number; // e.g. 3 pieces
+  outOfStockCustomText?: string; // Custom CTA button label
+  allowBackorders?: boolean;
+  launchDiscount?: LaunchDiscountConfig;
+}
+
+export interface LaunchDiscountConfig {
+  enabled: boolean;
+  discountType: "PERCENTAGE" | "FIXED_AMOUNT" | "FREE_SHIPPING";
+  discountValue: number; // e.g. 15 (for 15%) or 20 (for R$ 20)
+  couponCode: string; // e.g. "INAUGURACAO15"
+  maxFirstOrders: number; // e.g. 20
+  minOrderAmount: number; // e.g. 100
+  applyAutomatically: boolean;
+  bannerEnabled: boolean;
+  bannerHeadline: string;
+  presetName?: string;
+  expirationDays?: number;
+}
+
+export interface TenantStore {
+  id: string;
+  name: string;
+  slug: string;
+  document: string; // CNPJ
+  planTier: SaaSPlanTier;
+  logo: string;
+  city: string;
+  state: string;
+  contactEmail: string;
+  contactWhatsapp: string;
+  whatsapp?: string;
+  activeProductsCount: number;
+  activeResellersCount: number;
+  customDomain?: string;
+  customDomainStatus?: "NOT_CONFIGURED" | "PENDING_DNS" | "SSL_PROVISIONING" | "ACTIVE" | "ERROR";
+  customDomainSslAutoManaged?: boolean;
+  tier?: string;
+  features: {
+    unlimitedProducts: boolean;
+    consignments: boolean;
+    commissionEngine: boolean;
+    digitalWarranty: boolean;
+    customJewelry: boolean;
+    whatsappAutomations: boolean;
+    aiGatewayMCP: boolean;
+    marketplaces: boolean;
+    multiUserRBAC: boolean;
+  };
+  launchDiscount?: LaunchDiscountConfig;
+}
+
+export type JewelryBath = "OURO_18K" | "RODIO_BRANCO" | "RODIO_NEGRO" | "PRATA_925" | "ROSE_GOLD";
+
+export type PublicationStatus = "DRAFT" | "PUBLISHED" | "HIDDEN" | "ARCHIVED";
+
+export interface ProductVariant {
+  id: string;
+  sku: string;
+  name: string; // Ex: Aro 16, Aro 18, 45cm, 50cm
+  type: "SIZE" | "LENGTH" | "BATH" | "COLOR";
+  value: string;
+  stockPhysical: number;
+  stockReserved?: number;
+  priceModifier?: number;
+}
+
+export interface ProductMedia {
+  id: string;
+  organization_id?: string;
+  product_id: string;
+  storage_key?: string; // Caminho/Key único no Object Storage (S3, GCS, Cloudflare R2, Supabase Storage)
+  url: string; // URL pública/CDN para entrega de alta performance
+  type: "IMAGE" | "VIDEO";
+  is_primary: boolean;
+  sort_order: number;
+  alt_text?: string;
+  created_at: string;
+  
+  // Metadados técnicos do arquivo para governança de storage
+  file_size_bytes?: number;
+  mime_type?: string;
+  width?: number;
+  height?: number;
+}
+
+export interface ProductItem {
+  id: string;
+  sku: string;
+  name: string;
+  brand?: string;
+  category: "COLARES" | "BRINCOS" | "ANEIS" | "PULSEIRAS" | "CONJUNTOS" | "PERSONALIZADOS";
+  collection: string;
+  
+  // Características
+  material: string;
+  bath: JewelryBath;
+  stones: string[];
+  stoneColor?: string;
+  weightGrams?: number;
+  dimensions?: string;
+  variants?: ProductVariant[];
+
+  // Informações Comerciais
+  price: number;
+  costPrice: number;
+  promoPrice?: number;
+  marginPercent?: number;
+
+  // Estoque (Double-Ledger & Readiness)
+  stockPhysical: number; // Em estoque físico da empresa
+  stockReserved?: number; // Reservado em pedidos abertos / pagamentos pendentes
+  stockConsigned: number; // Em maletas com revendedoras
+  stockAvailable: number; // Disponível para venda direta (Físico - Reservado)
+  availableStock?: number; // Alias para stockAvailable
+  currentStock?: number; // Alias para stockPhysical
+  locationId?: string; // Localização de estoque
+  stockLocation?: string; // Localização (ex: Gaveteiro A3, Prateleira 2)
+  minStockAlert?: number; // Alerta de estoque mínimo
+
+  // Mídia & Galeria Estruturada
+  imageUrl: string; // Imagem principal (retrocompatível e de acesso rápido)
+  galleryUrls?: string[]; // Galeria de fotos adicionais
+  media?: ProductMedia[]; // Estrutura relacional profissional para ordenação e atributos
+  videoUrl?: string; // Vídeo demonstrativo da peça
+
+  // Publicação vs Estoque
+  publicationStatus: PublicationStatus; // DRAFT (Rascunho) | PUBLISHED (Ativo) | HIDDEN (Oculto) | ARCHIVED
+  status: "ATIVO" | "PAUSADO" | "ESGOTADO"; // Legado / Status Operacional
+  
+  warrantyMonths: number;
+  isCustomizable: boolean;
+  description: string;
+}
+
+export interface InventoryLedgerEntry {
+  id: string;
+  timestamp: string;
+  productId: string;
+  sku: string;
+  productName: string;
+  type:
+    | "ENTRADA_FORNECEDOR"
+    | "ENVIO_CONSIGNACAO"
+    | "RETORNO_CONSIGNACAO"
+    | "VENDA_DIRETA"
+    | "VENDA_REVENDEDORA"
+    | "SAIDA_VENDA"
+    | "AJUSTE_INVENTARIO"
+    | "REVERSAO_ESTORNO";
+  qtyChange: number;
+  physicalBalanceAfter: number;
+  consignedBalanceAfter: number;
+  reversalOfMovementId?: string;
+  resellerId?: string;
+  resellerName?: string;
+  orderNumber?: string;
+  operator: string;
+  reason: string;
+}
+
+export interface Reseller {
+  id: string;
+  name: string;
+  email: string;
+  phone: string;
+  document?: string;
+  avatar: string;
+  level: "INICIANTE" | "PRATA" | "OURO" | "DIAMANTE";
+  isLeader: boolean;
+  leaderName?: string;
+  leaderId?: string;
+  teamSize?: number;
+  commissionDirectRate: number; // ex: 25 (%)
+  leaderBonusRate?: number; // ex: 5 (%)
+  totalSalesAccumulated: number;
+  currentConsignedValue?: number;
+  pendingCommissionValue: number;
+  activeConsignmentsCount?: number;
+  city: string;
+  state: string;
+  status: "ATIVA" | "PENDENTE" | "BLOQUEADA";
+  joinedAt?: string;
+}
+
+export interface ConsignmentItem {
+  productId: string;
+  sku: string;
+  productName: string;
+  unitPrice: number;
+  unitCost?: number;
+  quantityShipped: number;
+  quantitySold: number;
+  quantityReturned: number;
+  quantityPending: number;
+}
+
+export interface ConsignmentMaleta {
+  id: string;
+  code: string; // ex: MLT-2026-08
+  resellerId: string;
+  resellerName: string;
+  resellerPhone: string;
+  startDate: string;
+  dueDate: string;
+  status: "EM_ABERTO" | "PARCIALMENTE_ACERTADA" | "FINALIZADA" | "VENCIDA";
+  items: ConsignmentItem[];
+  totalValue: number;
+  soldValue: number;
+  returnedValue?: number;
+  pendingValue: number;
+  commissionCalculated: number;
+  commissionPaid: boolean;
+  settlementDate?: string;
+  notes?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface CommissionTier {
+  id: string;
+  minSales: number;
+  maxSales: number;
+  ratePercent: number;
+  leaderBonusPercent: number;
+  badge: string;
+}
+
+export interface CommissionSettlement {
+  id: string;
+  period: string;
+  resellerId: string;
+  resellerName: string;
+  isLeader: boolean;
+  directSalesTotal: number;
+  directCommissionEarned: number;
+  teamSalesTotal?: number;
+  teamBonusEarned?: number;
+  totalPayable: number;
+  status: "CALCULADO" | "APROVADO" | "PAGO";
+  paymentDate?: string;
+  receiptNumber?: string;
+}
+
+export interface DigitalWarranty {
+  id: string;
+  code: string; // ex: GRT-8F2A9D
+  orderId?: string;
+  customerName: string;
+  customerDocument: string; // CPF
+  customerPhone: string;
+  customerEmail: string;
+  orderNumber: string;
+  sku: string;
+  productName: string;
+  bathType: string;
+  issueDate: string;
+  expirationDate: string;
+  status: "VALIDA" | "REPARO_SOLICITADO" | "CONCLUIDA" | "EXPIRADA";
+  terms: string;
+  channel: string;
+  resellerName?: string;
+  claimsCount: number;
+  claimLogs?: Array<{
+    date: string;
+    description: string;
+    status: string;
+  }>;
+}
+
+export interface CustomJewelryOrderSpec {
+  engravingName: string;
+  fontStyle: "CURSIVA" | "CLASSICA" | "MINIMALISTA" | "MODERNA";
+  gemStone: "ZIRCONIA_CRISTAL" | "ESMERALDA_FUSION" | "RUBI_SYNTH" | "TURMALINA_PARAIBA";
+  bathFinish: JewelryBath;
+  chainLengthCm: 40 | 45 | 50 | 60;
+  giftBox: boolean;
+  specialNotes?: string;
+}
+
+// ============================================================================
+// SPRINT 3 & 4: CUSTOMERS & ORDERS DOMAIN TYPES
+// ============================================================================
+
+export * from "./customer";
+export * from "./order";
+
+// ============================================================================
+// OS TRÊS NÍVEIS DO ECOSSISTEMA WLSaaSERP
+// ============================================================================
+
+/**
+ * Nível 1 — Willian (Dono da plataforma)
+ * Papel: SUPER_ADMIN
+ * Controla: Clientes SaaS, organizações, planos, assinaturas, módulos, utilização, suporte, segurança, auditoria.
+ */
+export type PlatformRole = "SUPER_ADMIN";
+
+/**
+ * Nível 2 — Cliente do WLSaaSERP (Loja de Semijoias)
+ * Usuários administrativos e operacionais da loja:
+ * - OWNER: Dona/Proprietária da marca
+ * - LOJA_ADMIN: Administrador geral da loja
+ * - GERENTE: Gerente comercial e operacional de estoque
+ * - VENDEDOR: Vendedor de balcão e atendimento WhatsApp
+ * - REVENDEDORA: Revendedora externa com maletas de consignação
+ */
+export type StoreUserRole =
+  | "OWNER"
+  | "LOJA_ADMIN"
+  | "GERENTE"
+  | "VENDEDOR"
+  | "REVENDEDORA"
+  | "GERENTE_COMERCIAL"
+  | "REVENDEDORA_PORTAL"
+  | "AI_GATEWAY";
+
+export type SystemUserRole = PlatformRole | StoreUserRole;
+
+/**
+ * Nível 3 — Consumidor da loja (Cliente Comprador Final)
+ * É quem compra a semijoia na vitrine pública.
+ * Fluxo: Consumidor -> Catálogo -> Produto -> Carrinho -> Pedido -> WhatsApp / pagamento
+ * ⚠️ NÃO pertence ao WLSaaSERP como usuário administrativo. Pertence ao ecossistema da loja.
+ */
+export interface StoreConsumer {
+  id?: string;
+  name: string;
+  phone: string; // WhatsApp
+  email?: string;
+  city?: string;
+  state?: string;
+  notes?: string;
+  totalOrdersCount?: number;
+  totalSpent?: number;
+  firstPurchasedAt?: string;
+  lastPurchasedAt?: string;
+}
+
+export type EcosystemLevel = "LEVEL_1_PLATFORM" | "LEVEL_2_STORE" | "LEVEL_3_CONSUMER";
+
+export interface RBACUser {
+  id: string;
+  name: string;
+  email: string;
+  role: SystemUserRole;
+  tenantId: string;
+  avatar?: string;
+  photoUrl?: string;
+  phone?: string;
+  bio?: string;
+  title?: string;
+}
+
+export interface AuditTrailLog {
+  id: string;
+  timestamp: string;
+  userName?: string;
+  userEmail?: string;
+  userRole?: "SUPER_ADMIN" | "LOJA_ADMIN" | "GERENTE_COMERCIAL" | "REVENDEDORA_PORTAL" | "AI_GATEWAY";
+  action: string; // ex: "ORDER_CANCELLED", "CONSIGNMENT_SETTLED", "WARRANTY_VALIDATED", "STOCK_LEDGER_ADJUSTED"
+  entity?: string;
+  entityId?: string;
+  targetEntity?: string;
+  resource?: string;
+  resourceId?: string;
+  actor?: string;
+  status?: "SUCESSO" | "NEGADO_RBAC" | "CONFIRMADO_HUMANO";
+  ipAddress: string;
+  userAgent?: string;
+  details?: string;
+  changes?: Record<string, any>;
+}
+
+export type AuditLogEntry = AuditTrailLog;
+
+export interface DomainSSLAuditEntry {
+  id: string;
+  timestamp: string;
+  adminName: string;
+  adminEmail: string;
+  adminRole: string;
+  domain: string;
+  action:
+    | "VALIDATE_DNS_AVAILABILITY"
+    | "PROVISION_AUTO_SSL"
+    | "UPDATE_CUSTOM_DOMAIN"
+    | "ENABLE_HTTPS_FORCE"
+    | "ENABLE_HSTS_POLICY"
+    | "DNS_VERIFICATION_CHECK"
+    | "SSL_RENEWAL_SIMULATION"
+    | "DNS_RECORD_MISMATCH";
+  status: "SUCESSO" | "EM_PROGRESSO" | "ALERTA_DNS" | "FALHA_PROVEDOR";
+  cnameTarget?: string;
+  ipTarget?: string;
+  dnsResponseTimeMs?: number;
+  sslIssuer?: string;
+  sslExpiresAt?: string;
+  ipAddress: string;
+  userAgent: string;
+  technicalDetails: string;
+}
+
+export interface MCPProposedAction {
+  id: string;
+  action?: string;
+  actionType?: string;
+  toolName?: string;
+  intent?: string;
+  description?: string;
+  title?: string;
+  riskLevel: "BAIXO" | "MEDIO" | "ALTO" | "CRITICO";
+  requiresConfirmation: boolean;
+  permissionRequired?: string;
+  parameters?: Record<string, any>;
+  params?: Record<string, any>;
+  payload?: Record<string, any>;
+  status?: "PENDENTE_APROVACAO" | "APROVADO_EXECUTADO" | "REJEITADO";
+  message?: string;
+}
+
+export type MCPActionProposal = MCPProposedAction;
+
+export type WebhookEventTopic =
+  | "order.placed"
+  | "order.paid"
+  | "order.cancelled"
+  | "consignment.issued"
+  | "consignment.settled"
+  | "consignment.item_sold"
+  | "warranty.generated"
+  | "customer.registered";
+
+export interface WebhookEndpointConfig {
+  id: string;
+  name: string;
+  url: string;
+  status: "ACTIVE" | "INACTIVE" | "ERROR";
+  secret: string;
+  events: WebhookEventTopic[];
+  contentType: "application/json";
+  retryPolicy: "EXPONENTIAL_BACKOFF" | "IMMEDIATE_3X";
+  customHeaders?: Record<string, string>;
+  createdAt: string;
+  lastDeliveredAt?: string;
+  lastDeliveryStatus?: "SUCCESS" | "FAILURE" | "PENDING";
+  successRate: number;
+  deliveryCount: number;
+  description?: string;
+}
+
+export interface WebhookDeliveryLog {
+  id: string;
+  endpointId: string;
+  endpointName: string;
+  endpointUrl: string;
+  event: WebhookEventTopic;
+  timestamp: string;
+  httpStatus: number;
+  status: "DELIVERED" | "FAILED" | "PENDING";
+  durationMs: number;
+  requestHeaders: Record<string, string>;
+  requestPayload: Record<string, any>;
+  responseHeaders?: Record<string, string>;
+  responseBody?: string;
+  attempt: number;
+  signatureHeader: string;
+}
+
+export interface InstallmentTierRule {
+  installments: number; // 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+  interestRatePercent: number; // 0 = sem juros, > 0 = taxa de juros percentual (ex: 2.0%)
+}
+
+export interface OrganizationPaymentSettings {
+  id?: string;
+  organizationId: string;
+
+  // Configuração PIX
+  pixEnabled: boolean;
+  pixDiscountPercent: number; // Desconto em % no PIX (ex: 5, 3, 7, 10)
+  pixKeyType?: "CNPJ" | "EMAIL" | "PHONE" | "RANDOM";
+  pixKey?: string;
+  pixExpirationMinutes?: number;
+
+  // Configuração Cartão de Crédito
+  creditCardEnabled: boolean;
+  maxInstallments: number; // Máximo de parcelas permitidas (ex: 6, 10, 12)
+  freeInstallmentsCount: number; // Quantidade de parcelas sem acréscimo (ex: 6, ou 3, etc.)
+  minInstallmentAmount: number; // Valor mínimo por parcela em R$ (ex: 25.00)
+  
+  // Tabela customizada de juros por parcela
+  installmentRules: InstallmentTierRule[];
+
+  // Boleto Bancário & Outros
+  boletoEnabled?: boolean;
+  boletoDiscountPercent?: number;
+
+  // Atendimento & Fechamento via WhatsApp
+  whatsappCheckoutEnabled: boolean;
+
+  // Políticas Comerciais
+  freeShippingMinimumAmount: number; // ex: 250.00
+  defaultStandardShippingCost: number; // ex: 18.90
+  
+  updatedAt?: string;
+}
+
+export interface CalculatedInstallmentOption {
+  installments: number;
+  installmentValue: number;
+  totalAmount: number;
+  interestRatePercent: number;
+  isInterestFree: boolean;
+}
+
+export interface StoreSmtpConfig {
+  id?: string;
+  tenantId?: string;
+  enabled: boolean;
+  provider: "CUSTOM" | "GMAIL" | "OUTLOOK" | "AMAZON_SES" | "SENDGRID" | "RESEND";
+  host: string;
+  port: number;
+  encryption: "TLS" | "SSL" | "STARTTLS" | "NONE";
+  username: string;
+  password?: string;
+  fromName: string;
+  fromEmail: string;
+  replyToEmail?: string;
+  // Trigger switches
+  autoSendDigitalWarranty: boolean;
+  autoSendOrderPlaced: boolean;
+  autoSendPaymentApproved: boolean;
+  autoSendOrderDispatched: boolean;
+  autoSendStockAlerts: boolean;
+  // Custom Email Templates (HTML / Liquid)
+  warrantyEmailSubject?: string;
+  warrantyEmailTemplate?: string;
+  // Verification & Health
+  lastTestedAt?: string;
+  lastTestStatus?: "SUCCESS" | "FAILED" | "UNTESTED";
+  lastTestMessage?: string;
+  updatedAt?: string;
+}
+
+

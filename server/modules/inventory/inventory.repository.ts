@@ -89,22 +89,23 @@ function mapRowToReservation(row: any): InventoryReservationEntity {
 
 export interface IInventoryRepository {
   createMovement(movement: InventoryMovementEntity, tx?: TransactionContext): Promise<InventoryMovementEntity>;
-  removeMovement(id: string): Promise<boolean>;
-  findById(orgId: string, id: string): Promise<InventoryMovementEntity | null>;
-  listMovementsByOrg(orgId: string, limit?: number): Promise<InventoryMovementEntity[]>;
-  listMovementsByProduct(orgId: string, productId: string, limit?: number): Promise<InventoryMovementEntity[]>;
-  listMovements(orgId: string, productId?: string, limit?: number): Promise<InventoryMovementEntity[]>;
+  removeMovement(id: string, orgId?: string, tx?: TransactionContext): Promise<boolean>;
+  findById(orgId: string, id: string, tx?: TransactionContext): Promise<InventoryMovementEntity | null>;
+  listMovementsByOrg(orgId: string, limit?: number, tx?: TransactionContext): Promise<InventoryMovementEntity[]>;
+  listMovementsByProduct(orgId: string, productId: string, limit?: number, tx?: TransactionContext): Promise<InventoryMovementEntity[]>;
+  listMovements(orgId: string, productId?: string, limit?: number, tx?: TransactionContext): Promise<InventoryMovementEntity[]>;
   
   // Locations
-  listLocations(orgId: string): Promise<InventoryLocationEntity[]>;
-  findLocationById(orgId: string, locationId: string): Promise<InventoryLocationEntity | null>;
-  createLocation(location: InventoryLocationEntity): Promise<InventoryLocationEntity>;
+  listLocations(orgId: string, tx?: TransactionContext): Promise<InventoryLocationEntity[]>;
+  findLocationById(orgId: string, locationId: string, tx?: TransactionContext): Promise<InventoryLocationEntity | null>;
+  createLocation(location: InventoryLocationEntity, tx?: TransactionContext): Promise<InventoryLocationEntity>;
 
   // Multi-Dimensional Balances (Product + Location)
   getBalance(orgId: string, productId: string, locationId: string, tx?: TransactionContext): Promise<InventoryBalanceEntity | null>;
   getBalanceForUpdate(orgId: string, productId: string, locationId: string, tx?: TransactionContext): Promise<InventoryBalanceEntity | null>;
-  listBalancesByProduct(orgId: string, productId: string): Promise<InventoryBalanceEntity[]>;
-  listBalancesByLocation(orgId: string, locationId: string): Promise<InventoryBalanceEntity[]>;
+  listBalancesByProduct(orgId: string, productId: string, tx?: TransactionContext): Promise<InventoryBalanceEntity[]>;
+  listBalancesByLocation(orgId: string, locationId: string, tx?: TransactionContext): Promise<InventoryBalanceEntity[]>;
+  listAllBalancesByOrg(orgId: string, tx?: TransactionContext): Promise<InventoryBalanceEntity[]>;
   upsertBalance(balance: InventoryBalanceEntity, tx?: TransactionContext): Promise<InventoryBalanceEntity>;
   
   // Atomic Concurrency & Integrity Protected Operations (enforcing DB CHECK constraints)
@@ -124,12 +125,21 @@ export interface IInventoryRepository {
     extra?: Partial<InventoryReservationEntity>,
     tx?: TransactionContext
   ): Promise<InventoryReservationEntity | null>;
-  listActiveReservations(orgId: string): Promise<InventoryReservationEntity[]>;
+  listActiveReservations(orgId: string, tx?: TransactionContext): Promise<InventoryReservationEntity[]>;
+  listReservations(
+    orgId: string,
+    filter?: {
+      status?: InventoryReservationStatus;
+      productId?: string;
+      locationId?: string;
+    },
+    tx?: TransactionContext
+  ): Promise<InventoryReservationEntity[]>;
   expireStaleReservations(orgId: string): Promise<InventoryReservationEntity[]>;
 
   // Aggregation & Reconciliation
-  recalculateProductBalance(orgId: string, productId: string): Promise<InventoryStockSummary>;
-  getStockSummary(orgId: string, productId: string): Promise<InventoryStockSummary>;
+  recalculateProductBalance(orgId: string, productId: string, tx?: TransactionContext): Promise<InventoryStockSummary>;
+  getStockSummary(orgId: string, productId: string, tx?: TransactionContext): Promise<InventoryStockSummary>;
   getAllStockSummariesByOrg(orgId: string): Promise<Map<string, InventoryStockSummary>>;
 }
 
@@ -179,14 +189,31 @@ export class InventoryRepository implements IInventoryRepository {
     });
   }
 
-  async removeMovement(id: string): Promise<boolean> {
+  async removeMovement(id: string, orgId?: string, tx?: TransactionContext): Promise<boolean> {
+    if (tx) {
+      return tx.stagedInventoryMovements.delete(id);
+    }
+    const effectiveOrgId = orgId || TenantContext.get()?.tenantId;
+    if (effectiveOrgId) {
+      return this.withTenant(effectiveOrgId, async () => {
+        const res = await query(
+          "DELETE FROM inventory_movements WHERE organization_id = $1 AND id = $2",
+          [effectiveOrgId, id]
+        );
+        return (res.rowCount || 0) > 0;
+      });
+    }
     const res = await query("DELETE FROM inventory_movements WHERE id = $1", [id]);
     return (res.rowCount || 0) > 0;
   }
 
-  async findById(orgId: string, id: string): Promise<InventoryMovementEntity | null> {
+  async findById(orgId: string, id: string, tx?: TransactionContext): Promise<InventoryMovementEntity | null> {
+    if (tx && tx.stagedInventoryMovements.has(id)) {
+      return tx.stagedInventoryMovements.get(id);
+    }
     return this.withTenant(orgId, async () => {
-      const res = await query(
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(
         "SELECT * FROM inventory_movements WHERE organization_id = $1 AND id = $2",
         [orgId, id]
       );
@@ -195,9 +222,10 @@ export class InventoryRepository implements IInventoryRepository {
     });
   }
 
-  async listMovementsByOrg(orgId: string, limit = 100): Promise<InventoryMovementEntity[]> {
+  async listMovementsByOrg(orgId: string, limit = 100, tx?: TransactionContext): Promise<InventoryMovementEntity[]> {
     return this.withTenant(orgId, async () => {
-      const res = await query(
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(
         "SELECT * FROM inventory_movements WHERE organization_id = $1 ORDER BY created_at DESC LIMIT $2",
         [orgId, limit]
       );
@@ -208,10 +236,12 @@ export class InventoryRepository implements IInventoryRepository {
   async listMovementsByProduct(
     orgId: string,
     productId: string,
-    limit = 50
+    limit = 50,
+    tx?: TransactionContext
   ): Promise<InventoryMovementEntity[]> {
     return this.withTenant(orgId, async () => {
-      const res = await query(
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(
         "SELECT * FROM inventory_movements WHERE organization_id = $1 AND product_id = $2 ORDER BY created_at DESC LIMIT $3",
         [orgId, productId, limit]
       );
@@ -222,19 +252,21 @@ export class InventoryRepository implements IInventoryRepository {
   async listMovements(
     orgId: string,
     productId?: string,
-    limit = 100
+    limit = 100,
+    tx?: TransactionContext
   ): Promise<InventoryMovementEntity[]> {
     if (productId) {
-      return await this.listMovementsByProduct(orgId, productId, limit);
+      return await this.listMovementsByProduct(orgId, productId, limit, tx);
     }
-    return await this.listMovementsByOrg(orgId, limit);
+    return await this.listMovementsByOrg(orgId, limit, tx);
   }
 
   // --- Inventory Locations ---
 
-  async listLocations(orgId: string): Promise<InventoryLocationEntity[]> {
+  async listLocations(orgId: string, tx?: TransactionContext): Promise<InventoryLocationEntity[]> {
     return this.withTenant(orgId, async () => {
-      const res = await query(
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(
         "SELECT * FROM inventory_locations WHERE organization_id = $1 AND is_active = TRUE ORDER BY name ASC",
         [orgId]
       );
@@ -242,9 +274,10 @@ export class InventoryRepository implements IInventoryRepository {
     });
   }
 
-  async findLocationById(orgId: string, locationId: string): Promise<InventoryLocationEntity | null> {
+  async findLocationById(orgId: string, locationId: string, tx?: TransactionContext): Promise<InventoryLocationEntity | null> {
     return this.withTenant(orgId, async () => {
-      const res = await query(
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(
         "SELECT * FROM inventory_locations WHERE organization_id = $1 AND id = $2",
         [orgId, locationId]
       );
@@ -253,9 +286,10 @@ export class InventoryRepository implements IInventoryRepository {
     });
   }
 
-  async createLocation(location: InventoryLocationEntity): Promise<InventoryLocationEntity> {
+  async createLocation(location: InventoryLocationEntity, tx?: TransactionContext): Promise<InventoryLocationEntity> {
     return this.withTenant(location.organizationId, async () => {
-      const res = await query(
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(
         `INSERT INTO inventory_locations (
           id, organization_id, name, code, type, is_active, description, created_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
@@ -333,19 +367,33 @@ export class InventoryRepository implements IInventoryRepository {
     });
   }
 
-  async listBalancesByProduct(orgId: string, productId: string): Promise<InventoryBalanceEntity[]> {
+  async listBalancesByProduct(orgId: string, productId: string, tx?: TransactionContext): Promise<InventoryBalanceEntity[]> {
     return this.withTenant(orgId, async () => {
-      const res = await query(
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(
         "SELECT * FROM inventory_balances WHERE organization_id = $1 AND product_id = $2",
         [orgId, productId]
       );
-      return res.rows.map(mapRowToBalance);
+      const byLocation = new Map<string, InventoryBalanceEntity>();
+      for (const row of res.rows) {
+        const bal = mapRowToBalance(row);
+        byLocation.set(bal.locationId, bal);
+      }
+      if (tx) {
+        for (const staged of tx.stagedInventoryBalances.values()) {
+          if (staged.organizationId === orgId && staged.productId === productId) {
+            byLocation.set(staged.locationId, staged);
+          }
+        }
+      }
+      return Array.from(byLocation.values());
     });
   }
 
-  async listBalancesByLocation(orgId: string, locationId: string): Promise<InventoryBalanceEntity[]> {
+  async listBalancesByLocation(orgId: string, locationId: string, tx?: TransactionContext): Promise<InventoryBalanceEntity[]> {
     return this.withTenant(orgId, async () => {
-      const res = await query(
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(
         "SELECT * FROM inventory_balances WHERE organization_id = $1 AND location_id = $2",
         [orgId, locationId]
       );
@@ -353,9 +401,10 @@ export class InventoryRepository implements IInventoryRepository {
     });
   }
 
-  async listAllBalancesByOrg(orgId: string): Promise<InventoryBalanceEntity[]> {
+  async listAllBalancesByOrg(orgId: string, tx?: TransactionContext): Promise<InventoryBalanceEntity[]> {
     return this.withTenant(orgId, async () => {
-      const res = await query(
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(
         "SELECT * FROM inventory_balances WHERE organization_id = $1",
         [orgId]
       );
@@ -654,7 +703,8 @@ export class InventoryRepository implements IInventoryRepository {
       return tx.stagedInventoryReservations.get(reservationId);
     }
     return this.withTenant(orgId, async () => {
-      const res = await query(
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(
         "SELECT * FROM inventory_reservations WHERE organization_id = $1 AND id = $2",
         [orgId, reservationId]
       );
@@ -672,7 +722,8 @@ export class InventoryRepository implements IInventoryRepository {
       }
     }
     return this.withTenant(orgId, async () => {
-      const res = await query(
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(
         "SELECT * FROM inventory_reservations WHERE organization_id = $1 AND idempotency_key = $2",
         [orgId, idempotencyKey]
       );
@@ -727,8 +778,8 @@ export class InventoryRepository implements IInventoryRepository {
     });
   }
 
-  async listActiveReservations(orgId: string): Promise<InventoryReservationEntity[]> {
-    return this.listReservations(orgId, { status: "ACTIVE" });
+  async listActiveReservations(orgId: string, tx?: TransactionContext): Promise<InventoryReservationEntity[]> {
+    return this.listReservations(orgId, { status: "ACTIVE" }, tx);
   }
 
   async listReservations(
@@ -737,7 +788,8 @@ export class InventoryRepository implements IInventoryRepository {
       status?: InventoryReservationStatus;
       productId?: string;
       locationId?: string;
-    }
+    },
+    tx?: TransactionContext
   ): Promise<InventoryReservationEntity[]> {
     return this.withTenant(orgId, async () => {
       let sql = "SELECT * FROM inventory_reservations WHERE organization_id = $1";
@@ -758,7 +810,8 @@ export class InventoryRepository implements IInventoryRepository {
       }
 
       sql += " ORDER BY created_at DESC";
-      const res = await query(sql, params);
+      const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+      const res = await queryFn(sql, params);
       return res.rows.map(mapRowToReservation);
     });
   }
@@ -776,9 +829,9 @@ export class InventoryRepository implements IInventoryRepository {
   /**
    * SOURCE OF TRUTH RECOMPUTATION & MULTI-LOCATION AGGREGATION
    */
-  async recalculateProductBalance(orgId: string, productId: string): Promise<InventoryStockSummary> {
-    const balances = await this.listBalancesByProduct(orgId, productId);
-    const locations = await this.listLocations(orgId);
+  async recalculateProductBalance(orgId: string, productId: string, tx?: TransactionContext): Promise<InventoryStockSummary> {
+    const balances = await this.listBalancesByProduct(orgId, productId, tx);
+    const locations = await this.listLocations(orgId, tx);
     const locMap = new Map<string, InventoryLocationEntity>();
     locations.forEach((l) => locMap.set(l.id, l));
 
@@ -831,8 +884,8 @@ export class InventoryRepository implements IInventoryRepository {
     };
   }
 
-  async getStockSummary(orgId: string, productId: string): Promise<InventoryStockSummary> {
-    return await this.recalculateProductBalance(orgId, productId);
+  async getStockSummary(orgId: string, productId: string, tx?: TransactionContext): Promise<InventoryStockSummary> {
+    return await this.recalculateProductBalance(orgId, productId, tx);
   }
 
   async getAllStockSummariesByOrg(orgId: string): Promise<Map<string, InventoryStockSummary>> {

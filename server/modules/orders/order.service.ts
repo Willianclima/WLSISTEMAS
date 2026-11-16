@@ -101,11 +101,21 @@ export class OrderService {
    * Helper to hydrate order relationships (Items, Payments, FSM Transitions)
    */
   private static async hydrateOrderAsync(order: OrderEntity, tx?: TransactionContext): Promise<OrderEntity> {
-    const [items, payments, transitions] = await Promise.all([
-      OrderRepository.getItemsByOrderIdAsync(order.organizationId, order.id, tx),
-      OrderRepository.getPaymentsByOrderIdAsync(order.organizationId, order.id, tx),
-      OrderRepository.getTransitionsByOrderIdAsync(order.organizationId, order.id, tx),
-    ]);
+    let items: OrderItemEntity[];
+    let payments: OrderPaymentEntity[];
+    let transitions: OrderStateTransitionEntity[];
+
+    if (tx) {
+      items = await OrderRepository.getItemsByOrderIdAsync(order.organizationId, order.id, tx);
+      payments = await OrderRepository.getPaymentsByOrderIdAsync(order.organizationId, order.id, tx);
+      transitions = await OrderRepository.getTransitionsByOrderIdAsync(order.organizationId, order.id, tx);
+    } else {
+      [items, payments, transitions] = await Promise.all([
+        OrderRepository.getItemsByOrderIdAsync(order.organizationId, order.id),
+        OrderRepository.getPaymentsByOrderIdAsync(order.organizationId, order.id),
+        OrderRepository.getTransitionsByOrderIdAsync(order.organizationId, order.id),
+      ]);
+    }
 
     return {
       ...order,
@@ -146,9 +156,11 @@ export class OrderService {
       }
     }
 
+    // Fetch organization details before opening DB transaction to avoid secondary pool connections
+    const org = await orgRepo.findById(organizationId);
+
     return await UnitOfWork.transaction(organizationId, async (tx: TransactionContext) => {
-      // Fetch organization details to ensure tenant-accurate defaults
-      const org = await orgRepo.findById(organizationId);
+      const queryFn = tx.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
 
       // 1. Resolve Customer Snapshot (Frozen at order time)
       let customerId = dto.customerId;
@@ -156,7 +168,7 @@ export class OrderService {
 
       if (customerId) {
         try {
-          existingCustomer = await CustomerService.getCustomerById(organizationId, customerId);
+          existingCustomer = await CustomerService.getCustomerById(organizationId, customerId, tx);
         } catch {
           // not found by id
         }
@@ -170,7 +182,7 @@ export class OrderService {
 
         if (doc || phone || email) {
           try {
-            const foundCust = await query(
+            const foundCust = await queryFn(
               `SELECT * FROM customers WHERE organization_id = $1 AND (
                 ($2 <> '' AND (cpf = $2 OR document = $2)) OR
                 ($3 <> '' AND (primary_phone = $3 OR whatsapp = $3)) OR
@@ -198,7 +210,7 @@ export class OrderService {
         const custPhone = inputSnap?.phone || inputSnap?.whatsapp || org?.contactWhatsapp || "";
 
         try {
-          await query(
+          await queryFn(
             `INSERT INTO customers (
               id, organization_id, person_type, name, document, email, phone, full_name, cpf,
               primary_email, primary_phone, whatsapp, status, customer_tier, notes, created_at, updated_at
@@ -226,7 +238,7 @@ export class OrderService {
           console.error("CUSTOMER INSERT FAILED:", insertErr);
           // If conflict on organization_id + cpf, select that customer
           if (custDoc) {
-            const fallbackCust = await query(
+            const fallbackCust = await queryFn(
               "SELECT * FROM customers WHERE organization_id = $1 AND (cpf = $2 OR document = $2) LIMIT 1",
               [organizationId, custDoc]
             );
@@ -310,34 +322,37 @@ export class OrderService {
       const itemsEntities: OrderItemEntity[] = [];
 
       // Resolve default inventory location dynamically for tenant
-      const orgLocations = await inventoryRepo.listLocations(organizationId);
+      const orgLocations = await inventoryRepo.listLocations(organizationId, tx);
       let defaultLoc = orgLocations.find((l) => l.type === "HEADQUARTERS" || l.code === "MATRIZ") || orgLocations[0];
       if (!defaultLoc) {
         try {
-          defaultLoc = await inventoryRepo.createLocation({
-            id: `loc-${organizationId}-matriz`,
-            organizationId,
-            name: "Estoque Matriz",
-            code: "MATRIZ",
-            type: "HEADQUARTERS",
-            isActive: true,
-            createdAt: new Date().toISOString(),
-          });
+          defaultLoc = await inventoryRepo.createLocation(
+            {
+              id: `loc-${organizationId}-matriz`,
+              organizationId,
+              name: "Estoque Matriz",
+              code: "MATRIZ",
+              type: "HEADQUARTERS",
+              isActive: true,
+              createdAt: new Date().toISOString(),
+            },
+            tx
+          );
         } catch {
           // If already exists or error, fetch again
-          const refetched = await inventoryRepo.listLocations(organizationId);
+          const refetched = await inventoryRepo.listLocations(organizationId, tx);
           defaultLoc = refetched[0];
         }
       }
       const defaultLocationId = defaultLoc?.id || `loc-${organizationId}-default`;
 
       for (const itemDto of dto.items) {
-        let prod = await productRepo.findById(organizationId, itemDto.productId);
+        let prod = await productRepo.findById(organizationId, itemDto.productId, tx);
         if (!prod && (itemDto as any).sku) {
-          prod = await productRepo.findBySku(organizationId, (itemDto as any).sku);
+          prod = await productRepo.findBySku(organizationId, (itemDto as any).sku, tx);
         }
         if (!prod) {
-          const allProds = await productRepo.listByOrg(organizationId);
+          const allProds = await productRepo.listByOrg(organizationId, undefined, tx);
           prod = allProds.find(
             (p) =>
               p.id === itemDto.productId ||
@@ -404,7 +419,7 @@ export class OrderService {
       let resellerCommissionAmount: number | undefined;
 
       if (dto.resellerId) {
-        const reseller = await userRepo.findById(dto.resellerId);
+        const reseller = await userRepo.findById(dto.resellerId, tx);
         if (reseller) {
           resellerName = reseller.name;
         }
@@ -502,7 +517,7 @@ export class OrderService {
       // 8. Process Initial Payments if provided
       if (dto.payments && dto.payments.length > 0) {
         for (const payDto of dto.payments) {
-          await this.addOrderPaymentTransactional(organizationId, orderEntity, payDto, operatorName, tx);
+          await this.addOrderPaymentTransactional(organizationId, orderEntity, payDto, operatorName, tx, org);
         }
       }
 
@@ -516,7 +531,8 @@ export class OrderService {
         "127.0.0.1",
         operatorName,
         `Pedido #${orderNumber} criado com sucesso (Total: R$ ${totalAmount.toFixed(2)}, Canal: ${dto.channel}).`,
-        { orderId, orderNumber, itemsCount: itemsEntities.length, totalAmount, initialStatus }
+        { orderId, orderNumber, itemsCount: itemsEntities.length, totalAmount, initialStatus },
+        { tx }
       );
 
       return this.hydrateOrder(orderEntity, tx);
@@ -531,7 +547,8 @@ export class OrderService {
     order: OrderEntity,
     dto: CreateOrderPaymentDTO,
     operatorName: string,
-    tx: TransactionContext
+    tx: TransactionContext,
+    org?: { name?: string; city?: string } | null
   ): Promise<OrderPaymentEntity> {
     const nowIso = new Date().toISOString();
     const gateway = dto.gateway || (dto.paymentMethod === "PIX" ? "MERCADOPAGO" : "MANUAL");
@@ -541,7 +558,6 @@ export class OrderService {
     let pixExpiration: string | undefined;
 
     if (dto.paymentMethod === "PIX") {
-      const org = await orgRepo.findById(organizationId);
       const pix = this.generatePixPayload(dto.amount, order.orderNumber, org?.name, org?.city);
       pixQrCodeUrl = pix.qrUrl;
       pixCopyPaste = dto.pixCopyPaste || pix.pixCode;
@@ -588,13 +604,15 @@ export class OrderService {
     dto: CreateOrderPaymentDTO,
     operatorName: string = "Operador Financeiro"
   ): Promise<OrderPaymentEntity> {
+    const org = dto.paymentMethod === "PIX" ? await orgRepo.findById(organizationId) : null;
+
     return await UnitOfWork.transaction(organizationId, async (tx: TransactionContext) => {
       const order = await OrderRepository.findByIdAsync(organizationId, orderId, tx);
       if (!order) {
         throw new Error("Pedido não encontrado.");
       }
 
-      const payment = await this.addOrderPaymentTransactional(organizationId, order, dto, operatorName, tx);
+      const payment = await this.addOrderPaymentTransactional(organizationId, order, dto, operatorName, tx, org);
 
       if (order.status === "DRAFT" || order.status === "INVENTORY_RESERVED" || order.status === "PENDING_CONFIRMATION") {
         await this.transitionOrderTransactional(organizationId, orderId, {
@@ -733,7 +751,8 @@ export class OrderService {
         "127.0.0.1",
         operatorName,
         `Devolução de mercadorias no pedido #${order.orderNumber}: ${targetStatus} (${totalReturnedItemsCount}/${totalOrderItemsCount} itens devolvidos).`,
-        { orderId, orderNumber: order.orderNumber, isTotalReturn, targetStatus, returnedGoodsValue }
+        { orderId, orderNumber: order.orderNumber, isTotalReturn, targetStatus, returnedGoodsValue },
+        { tx }
       );
 
       return this.hydrateOrder(order, tx);
@@ -769,7 +788,8 @@ export class OrderService {
         "127.0.0.1",
         dto.operatorName || "Operador Financeiro",
         `Estorno financeiro processado para o pedido #${order.orderNumber}: R$ ${dto.amount.toFixed(2)}. Motivo: ${dto.reason}`,
-        { orderId, amount: dto.amount, paymentStatus: order.paymentStatus }
+        { orderId, amount: dto.amount, paymentStatus: order.paymentStatus },
+        { tx }
       );
 
       return await this.hydrateOrderAsync(order, tx);
@@ -1028,7 +1048,8 @@ export class OrderService {
       "127.0.0.1",
       operatorName,
       `Pedido #${order.orderNumber} mudou de status: ${currentStatus} -> ${nextStatus} (Evento: ${dto.event}).`,
-      { orderId, fromStatus: currentStatus, toStatus: nextStatus, event: dto.event }
+      { orderId, fromStatus: currentStatus, toStatus: nextStatus, event: dto.event },
+      { tx }
     );
 
     return await this.hydrateOrderAsync(order, tx);

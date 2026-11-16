@@ -1,4 +1,4 @@
-import { query, withTransaction } from "../../db/postgres";
+import { PgPoolClientLike, query, withTransaction } from "../../db/postgres";
 import {
   ProductEntity,
   ProductFilterQuery,
@@ -7,9 +7,9 @@ import {
 } from "./product.types";
 
 export interface IProductRepository {
-  findById(orgId: string, id: string): Promise<ProductEntity | null>;
-  findBySku(orgId: string, sku: string): Promise<ProductEntity | null>;
-  listByOrg(orgId: string, filter?: ProductFilterQuery): Promise<ProductEntity[]>;
+  findById(orgId: string, id: string, tx?: { pgClient?: PgPoolClientLike }): Promise<ProductEntity | null>;
+  findBySku(orgId: string, sku: string, tx?: { pgClient?: PgPoolClientLike }): Promise<ProductEntity | null>;
+  listByOrg(orgId: string, filter?: ProductFilterQuery, tx?: { pgClient?: PgPoolClientLike }): Promise<ProductEntity[]>;
   create(product: ProductEntity): Promise<ProductEntity>;
   update(orgId: string, id: string, partial: Partial<ProductEntity>): Promise<ProductEntity>;
   delete(orgId: string, id: string): Promise<boolean>;
@@ -80,39 +80,54 @@ function mapRowToMedia(row: any): ProductMediaEntity {
 }
 
 export class ProductRepository implements IProductRepository {
-  async findById(orgId: string, id: string): Promise<ProductEntity | null> {
-    const prodRes = await query(
+  private execQuery(orgId: string, text: string, params: any[], tx?: { pgClient?: PgPoolClientLike }) {
+    if (tx?.pgClient) {
+      return tx.pgClient.query(text, params);
+    }
+    return query(text, params, { context: { tenantId: orgId } });
+  }
+
+  async findById(orgId: string, id: string, tx?: { pgClient?: PgPoolClientLike }): Promise<ProductEntity | null> {
+    const prodRes = await this.execQuery(
+      orgId,
       "SELECT * FROM products WHERE organization_id = $1 AND id = $2",
-      [orgId, id]
+      [orgId, id],
+      tx
     );
     if (prodRes.rows.length === 0) return null;
 
-    const mediaRes = await query(
+    const mediaRes = await this.execQuery(
+      orgId,
       "SELECT * FROM product_media WHERE organization_id = $1 AND product_id = $2 ORDER BY sort_order ASC",
-      [orgId, id]
+      [orgId, id],
+      tx
     );
     const media = mediaRes.rows.map(mapRowToMedia);
     return mapRowToProduct(prodRes.rows[0], media);
   }
 
-  async findBySku(orgId: string, sku: string): Promise<ProductEntity | null> {
+  async findBySku(orgId: string, sku: string, tx?: { pgClient?: PgPoolClientLike }): Promise<ProductEntity | null> {
     const normalized = sku.trim().toUpperCase();
-    const prodRes = await query(
+    const prodRes = await this.execQuery(
+      orgId,
       "SELECT * FROM products WHERE organization_id = $1 AND UPPER(sku) = $2",
-      [orgId, normalized]
+      [orgId, normalized],
+      tx
     );
     if (prodRes.rows.length === 0) return null;
 
     const row = prodRes.rows[0];
-    const mediaRes = await query(
+    const mediaRes = await this.execQuery(
+      orgId,
       "SELECT * FROM product_media WHERE organization_id = $1 AND product_id = $2 ORDER BY sort_order ASC",
-      [orgId, row.id]
+      [orgId, row.id],
+      tx
     );
     const media = mediaRes.rows.map(mapRowToMedia);
     return mapRowToProduct(row, media);
   }
 
-  async listByOrg(orgId: string, filter?: ProductFilterQuery): Promise<ProductEntity[]> {
+  async listByOrg(orgId: string, filter?: ProductFilterQuery, tx?: { pgClient?: PgPoolClientLike }): Promise<ProductEntity[]> {
     let sql = "SELECT * FROM products WHERE organization_id = $1";
     const params: any[] = [orgId];
     let idx = 2;
@@ -163,14 +178,16 @@ export class ProductRepository implements IProductRepository {
       }
     }
 
-    const prodRes = await query(sql, params);
+    const prodRes = await this.execQuery(orgId, sql, params, tx);
     if (prodRes.rows.length === 0) return [];
 
     // Fetch all media for these products in batch
     const productIds = prodRes.rows.map((r) => r.id);
-    const mediaRes = await query(
+    const mediaRes = await this.execQuery(
+      orgId,
       "SELECT * FROM product_media WHERE organization_id = $1 AND product_id = ANY($2) ORDER BY sort_order ASC",
-      [orgId, productIds]
+      [orgId, productIds],
+      tx
     );
 
     const mediaMap = new Map<string, ProductMediaEntity[]>();
@@ -186,7 +203,8 @@ export class ProductRepository implements IProductRepository {
   }
 
   async create(product: ProductEntity): Promise<ProductEntity> {
-    const res = await query(
+    const res = await this.execQuery(
+      product.organizationId,
       `INSERT INTO products (
         id, organization_id, sku, name, category, collection, material, bath,
         stones, price, cost_price, promo_price, warranty_months, is_customizable,
@@ -222,10 +240,13 @@ export class ProductRepository implements IProductRepository {
     id: string,
     partial: Partial<ProductEntity>
   ): Promise<ProductEntity> {
-    const existing = await this.findById(orgId, id);
-    if (!existing) {
-      throw new Error(`Produto ${id} não encontrado na organização.`);
-    }
+    return await withTransaction(
+      async (client) => {
+        const tx = { pgClient: client };
+        const existing = await this.findById(orgId, id, tx);
+        if (!existing) {
+          throw new Error(`Produto ${id} não encontrado na organização.`);
+        }
 
     const setClauses: string[] = ["updated_at = NOW()"];
     const params: any[] = [orgId, id];
@@ -292,15 +313,22 @@ export class ProductRepository implements IProductRepository {
       params.push(partial.status);
     }
 
-    const sql = `UPDATE products SET ${setClauses.join(", ")} WHERE organization_id = $1 AND id = $2 RETURNING *`;
-    const res = await query(sql, params);
+        const sql = `UPDATE products SET ${setClauses.join(", ")} WHERE organization_id = $1 AND id = $2 RETURNING *`;
+        const res = await client.query(sql, params);
 
-    const mediaList = await this.listMediaByProduct(orgId, id);
-    return mapRowToProduct(res.rows[0], mediaList);
+        const mediaRes = await client.query(
+          "SELECT * FROM product_media WHERE organization_id = $1 AND product_id = $2 ORDER BY sort_order ASC",
+          [orgId, id]
+        );
+        return mapRowToProduct(res.rows[0], mediaRes.rows.map(mapRowToMedia));
+      },
+      { context: { tenantId: orgId } }
+    );
   }
 
   async delete(orgId: string, id: string): Promise<boolean> {
-    const res = await query(
+    const res = await this.execQuery(
+      orgId,
       "DELETE FROM products WHERE organization_id = $1 AND id = $2",
       [orgId, id]
     );
@@ -308,7 +336,8 @@ export class ProductRepository implements IProductRepository {
   }
 
   async countByOrg(orgId: string): Promise<number> {
-    const res = await query(
+    const res = await this.execQuery(
+      orgId,
       "SELECT count(*) as count FROM products WHERE organization_id = $1",
       [orgId]
     );
@@ -318,58 +347,66 @@ export class ProductRepository implements IProductRepository {
   // --- Product Media Implementation ---
 
   async addMedia(orgId: string, productId: string, dto: AddProductMediaDTO): Promise<ProductMediaEntity> {
-    const existingMedia = await this.listMediaByProduct(orgId, productId);
-    const isFirst = existingMedia.length === 0;
-    const isPrimary = dto.isPrimary !== undefined ? dto.isPrimary : isFirst;
-    const sortOrder = dto.sortOrder !== undefined ? dto.sortOrder : existingMedia.length;
-
-    return await withTransaction(async (client) => {
-      if (isPrimary) {
-        await client.query(
-          "UPDATE product_media SET is_primary = FALSE, updated_at = NOW() WHERE organization_id = $1 AND product_id = $2",
+    return await withTransaction(
+      async (client) => {
+        const existingRes = await client.query(
+          "SELECT * FROM product_media WHERE organization_id = $1 AND product_id = $2 ORDER BY sort_order ASC",
           [orgId, productId]
         );
-      }
+        const existingMedia = existingRes.rows.map(mapRowToMedia);
+        const isFirst = existingMedia.length === 0;
+        const isPrimary = dto.isPrimary !== undefined ? dto.isPrimary : isFirst;
+        const sortOrder = dto.sortOrder !== undefined ? dto.sortOrder : existingMedia.length;
 
-      const mediaId = `media-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
-      const res = await client.query(
-        `INSERT INTO product_media (
-          id, organization_id, product_id, storage_key, url, cdn_url,
-          media_type, mime_type, file_size_bytes, etag, is_primary,
-          sort_order, title, alt_text, created_at, updated_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
-        RETURNING *`,
-        [
-          mediaId,
-          orgId,
-          productId,
-          dto.storageKey,
-          dto.url,
-          dto.cdnUrl || dto.url,
-          dto.mediaType || "IMAGE",
-          dto.mimeType || "image/webp",
-          dto.fileSizeBytes || 0,
-          dto.etag || null,
-          isPrimary,
-          sortOrder,
-          dto.title || null,
-          dto.altText || null,
-        ]
-      );
+        if (isPrimary) {
+          await client.query(
+            "UPDATE product_media SET is_primary = FALSE, updated_at = NOW() WHERE organization_id = $1 AND product_id = $2",
+            [orgId, productId]
+          );
+        }
 
-      if (isPrimary) {
-        await client.query(
-          "UPDATE products SET image_url = $1, updated_at = NOW() WHERE organization_id = $2 AND id = $3",
-          [dto.url, orgId, productId]
+        const mediaId = `media-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+        const res = await client.query(
+          `INSERT INTO product_media (
+            id, organization_id, product_id, storage_key, url, cdn_url,
+            media_type, mime_type, file_size_bytes, etag, is_primary,
+            sort_order, title, alt_text, created_at, updated_at
+          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
+          RETURNING *`,
+          [
+            mediaId,
+            orgId,
+            productId,
+            dto.storageKey,
+            dto.url,
+            dto.cdnUrl || dto.url,
+            dto.mediaType || "IMAGE",
+            dto.mimeType || "image/webp",
+            dto.fileSizeBytes || 0,
+            dto.etag || null,
+            isPrimary,
+            sortOrder,
+            dto.title || null,
+            dto.altText || null,
+          ]
         );
-      }
 
-      return mapRowToMedia(res.rows[0]);
-    });
+        if (isPrimary) {
+          await client.query(
+            "UPDATE products SET image_url = $1, updated_at = NOW() WHERE organization_id = $2 AND id = $3",
+            [dto.url, orgId, productId]
+          );
+        }
+
+        return mapRowToMedia(res.rows[0]);
+      },
+      { context: { tenantId: orgId } }
+    );
   }
 
   async listMediaByProduct(orgId: string, productId: string): Promise<ProductMediaEntity[]> {
-    const res = await query(
+    const res = await this.execQuery(
+      orgId,
       "SELECT * FROM product_media WHERE organization_id = $1 AND product_id = $2 ORDER BY sort_order ASC",
       [orgId, productId]
     );
@@ -377,7 +414,8 @@ export class ProductRepository implements IProductRepository {
   }
 
   async findMediaById(orgId: string, mediaId: string): Promise<ProductMediaEntity | null> {
-    const res = await query(
+    const res = await this.execQuery(
+      orgId,
       "SELECT * FROM product_media WHERE organization_id = $1 AND id = $2",
       [orgId, mediaId]
     );
@@ -386,78 +424,91 @@ export class ProductRepository implements IProductRepository {
   }
 
   async deleteMedia(orgId: string, productId: string, mediaId: string): Promise<boolean> {
-    const target = await this.findMediaById(orgId, mediaId);
-    if (!target) return false;
-
-    await withTransaction(async (client) => {
-      await client.query(
-        "DELETE FROM product_media WHERE organization_id = $1 AND id = $2",
-        [orgId, mediaId]
-      );
-
-      if (target.isPrimary) {
-        const remaining = await client.query(
-          "SELECT * FROM product_media WHERE organization_id = $1 AND product_id = $2 ORDER BY sort_order ASC LIMIT 1",
-          [orgId, productId]
+    return await withTransaction(
+      async (client) => {
+        const targetRes = await client.query(
+          "SELECT * FROM product_media WHERE organization_id = $1 AND id = $2",
+          [orgId, mediaId]
         );
-        if (remaining.rows.length > 0) {
-          const nextPrimary = remaining.rows[0];
-          await client.query(
-            "UPDATE product_media SET is_primary = TRUE, updated_at = NOW() WHERE id = $1",
-            [nextPrimary.id]
-          );
-          await client.query(
-            "UPDATE products SET image_url = $1, updated_at = NOW() WHERE organization_id = $2 AND id = $3",
-            [nextPrimary.url, orgId, productId]
-          );
-        }
-      }
-    });
+        if (targetRes.rows.length === 0) return false;
+        const target = mapRowToMedia(targetRes.rows[0]);
 
-    return true;
+        await client.query(
+          "DELETE FROM product_media WHERE organization_id = $1 AND id = $2",
+          [orgId, mediaId]
+        );
+
+        if (target.isPrimary) {
+          const remaining = await client.query(
+            "SELECT * FROM product_media WHERE organization_id = $1 AND product_id = $2 ORDER BY sort_order ASC LIMIT 1",
+            [orgId, productId]
+          );
+          if (remaining.rows.length > 0) {
+            const nextPrimary = remaining.rows[0];
+            await client.query(
+              "UPDATE product_media SET is_primary = TRUE, updated_at = NOW() WHERE organization_id = $1 AND id = $2",
+              [orgId, nextPrimary.id]
+            );
+            await client.query(
+              "UPDATE products SET image_url = $1, updated_at = NOW() WHERE organization_id = $2 AND id = $3",
+              [nextPrimary.url, orgId, productId]
+            );
+          }
+        }
+
+        return true;
+      },
+      { context: { tenantId: orgId } }
+    );
   }
 
   async setPrimaryMedia(orgId: string, productId: string, mediaId: string): Promise<ProductMediaEntity> {
-    return await withTransaction(async (client) => {
-      await client.query(
-        "UPDATE product_media SET is_primary = FALSE, updated_at = NOW() WHERE organization_id = $1 AND product_id = $2",
-        [orgId, productId]
-      );
+    return await withTransaction(
+      async (client) => {
+        await client.query(
+          "UPDATE product_media SET is_primary = FALSE, updated_at = NOW() WHERE organization_id = $1 AND product_id = $2",
+          [orgId, productId]
+        );
 
-      const res = await client.query(
-        "UPDATE product_media SET is_primary = TRUE, updated_at = NOW() WHERE organization_id = $1 AND id = $2 RETURNING *",
-        [orgId, mediaId]
-      );
+        const res = await client.query(
+          "UPDATE product_media SET is_primary = TRUE, updated_at = NOW() WHERE organization_id = $1 AND id = $2 RETURNING *",
+          [orgId, mediaId]
+        );
 
-      if (res.rows.length === 0) {
-        throw new Error(`Mídia ${mediaId} não encontrada.`);
-      }
+        if (res.rows.length === 0) {
+          throw new Error(`Mídia ${mediaId} não encontrada.`);
+        }
 
-      const media = mapRowToMedia(res.rows[0]);
-      await client.query(
-        "UPDATE products SET image_url = $1, updated_at = NOW() WHERE organization_id = $2 AND id = $3",
-        [media.url, orgId, productId]
-      );
+        const media = mapRowToMedia(res.rows[0]);
+        await client.query(
+          "UPDATE products SET image_url = $1, updated_at = NOW() WHERE organization_id = $2 AND id = $3",
+          [media.url, orgId, productId]
+        );
 
-      return media;
-    });
+        return media;
+      },
+      { context: { tenantId: orgId } }
+    );
   }
 
   async reorderMedia(orgId: string, productId: string, orderedMediaIds: string[]): Promise<ProductMediaEntity[]> {
-    return await withTransaction(async (client) => {
-      for (let i = 0; i < orderedMediaIds.length; i++) {
-        await client.query(
-          "UPDATE product_media SET sort_order = $1, updated_at = NOW() WHERE organization_id = $2 AND product_id = $3 AND id = $4",
-          [i, orgId, productId, orderedMediaIds[i]]
-        );
-      }
+    return await withTransaction(
+      async (client) => {
+        for (let i = 0; i < orderedMediaIds.length; i++) {
+          await client.query(
+            "UPDATE product_media SET sort_order = $1, updated_at = NOW() WHERE organization_id = $2 AND product_id = $3 AND id = $4",
+            [i, orgId, productId, orderedMediaIds[i]]
+          );
+        }
 
-      const res = await client.query(
-        "SELECT * FROM product_media WHERE organization_id = $1 AND product_id = $2 ORDER BY sort_order ASC",
-        [orgId, productId]
-      );
-      return res.rows.map(mapRowToMedia);
-    });
+        const res = await client.query(
+          "SELECT * FROM product_media WHERE organization_id = $1 AND product_id = $2 ORDER BY sort_order ASC",
+          [orgId, productId]
+        );
+        return res.rows.map(mapRowToMedia);
+      },
+      { context: { tenantId: orgId } }
+    );
   }
 }
 

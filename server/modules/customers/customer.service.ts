@@ -1,4 +1,4 @@
-import { query, withTransaction } from "../../db/postgres";
+import { PgPoolClientLike, query, withTransaction } from "../../db/postgres";
 import {
   CustomerEntity,
   CustomerStatus,
@@ -170,9 +170,11 @@ export class CustomerService {
    */
   static async getCustomerById(
     organizationId: string,
-    customerId: string
+    customerId: string,
+    tx?: { pgClient?: PgPoolClientLike }
   ): Promise<CustomerEntity> {
-    const custRes = await query(
+    const queryFn = tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+    const custRes = await queryFn(
       "SELECT * FROM customers WHERE organization_id = $1 AND id = $2",
       [organizationId, customerId]
     );
@@ -181,16 +183,29 @@ export class CustomerService {
       throw new Error(`Cliente ${customerId} não encontrado para esta organização.`);
     }
 
-    const [addrRes, contRes] = await Promise.all([
-      query(
+    let addrRes;
+    let contRes;
+    if (tx?.pgClient) {
+      addrRes = await queryFn(
         "SELECT * FROM customer_addresses WHERE organization_id = $1 AND customer_id = $2",
         [organizationId, customerId]
-      ),
-      query(
+      );
+      contRes = await queryFn(
         "SELECT * FROM customer_contacts WHERE organization_id = $1 AND customer_id = $2",
         [organizationId, customerId]
-      ),
-    ]);
+      );
+    } else {
+      [addrRes, contRes] = await Promise.all([
+        queryFn(
+          "SELECT * FROM customer_addresses WHERE organization_id = $1 AND customer_id = $2",
+          [organizationId, customerId]
+        ),
+        queryFn(
+          "SELECT * FROM customer_contacts WHERE organization_id = $1 AND customer_id = $2",
+          [organizationId, customerId]
+        ),
+      ]);
+    }
 
     const addresses = addrRes.rows.map(mapRowToAddress);
     const contacts = contRes.rows.map(mapRowToContact);

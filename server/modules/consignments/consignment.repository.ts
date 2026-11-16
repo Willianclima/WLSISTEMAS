@@ -38,9 +38,19 @@ export class ConsignmentRepository {
     });
   }
 
-  async findById(id: string): Promise<ConsignmentEntity | null> {
-    const res = await query("SELECT * FROM consignments WHERE id = $1", [id]);
-    return res.rows.length > 0 ? mapRowToConsignment(res.rows[0]) : null;
+  async findById(id: string, orgId?: string): Promise<ConsignmentEntity | null> {
+    const effectiveOrgId = orgId || TenantContext.get()?.tenantId;
+    if (!effectiveOrgId) {
+      return null;
+    }
+
+    return TenantContext.run({ tenantId: effectiveOrgId }, async () => {
+      const res = await query(
+        "SELECT * FROM consignments WHERE organization_id = $1 AND id = $2",
+        [effectiveOrgId, id]
+      );
+      return res.rows.length > 0 ? mapRowToConsignment(res.rows[0]) : null;
+    });
   }
 
   async create(data: ConsignmentEntity): Promise<ConsignmentEntity> {

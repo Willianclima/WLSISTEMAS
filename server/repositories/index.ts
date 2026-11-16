@@ -8,7 +8,7 @@ import {
   SystemModuleKey,
   SaaSPlanId,
 } from "../types/saas";
-import { query } from "../db/postgres";
+import { PgPoolClientLike, query } from "../db/postgres";
 import { TenantContext } from "../db/tenantContext";
 
 // ============================================================================
@@ -25,7 +25,7 @@ export interface IOrganizationRepository {
 }
 
 export interface IUserRepository {
-  findById(id: string): Promise<UserEntity | null>;
+  findById(id: string, tx?: { pgClient?: PgPoolClientLike }): Promise<UserEntity | null>;
   findByEmail(email: string): Promise<UserEntity | null>;
   create(user: UserEntity): Promise<UserEntity>;
   update(id: string, partial: Partial<UserEntity>): Promise<UserEntity>;
@@ -33,12 +33,12 @@ export interface IUserRepository {
 }
 
 export interface IMembershipRepository {
-  findById(id: string): Promise<OrganizationMemberEntity | null>;
+  findById(id: string, orgId?: string): Promise<OrganizationMemberEntity | null>;
   findByOrgAndUser(orgId: string, userId: string): Promise<OrganizationMemberEntity | null>;
   listByUser(userId: string): Promise<OrganizationMemberEntity[]>;
   listByOrg(orgId: string): Promise<OrganizationMemberEntity[]>;
   create(member: OrganizationMemberEntity): Promise<OrganizationMemberEntity>;
-  update(id: string, partial: Partial<OrganizationMemberEntity>): Promise<OrganizationMemberEntity>;
+  update(id: string, partial: Partial<OrganizationMemberEntity>, orgId?: string): Promise<OrganizationMemberEntity>;
 }
 
 export interface ISubscriptionRepository {
@@ -279,8 +279,10 @@ export class OrganizationRepository implements IOrganizationRepository {
 }
 
 export class UserRepository implements IUserRepository {
-  async findById(id: string): Promise<UserEntity | null> {
-    const res = await query("SELECT * FROM users WHERE id = $1", [id]);
+  async findById(id: string, tx?: { pgClient?: PgPoolClientLike }): Promise<UserEntity | null> {
+    const res = tx?.pgClient
+      ? await tx.pgClient.query("SELECT * FROM users WHERE id = $1", [id])
+      : await query("SELECT * FROM users WHERE id = $1", [id]);
     return res.rows.length > 0 ? mapRowToUser(res.rows[0]) : null;
   }
 
@@ -362,13 +364,26 @@ export class UserRepository implements IUserRepository {
 }
 
 export class MembershipRepository implements IMembershipRepository {
-  async findById(id: string): Promise<OrganizationMemberEntity | null> {
-    const res = await query("SELECT * FROM organization_members WHERE id = $1", [id]);
-    return res.rows.length > 0 ? mapRowToMember(res.rows[0]) : null;
+  async findById(id: string, orgId?: string): Promise<OrganizationMemberEntity | null> {
+    const current = TenantContext.get();
+    const runWithContext = <T>(fn: () => Promise<T>) => {
+      if (orgId && current?.tenantId !== orgId) {
+        return TenantContext.run({ ...(current ?? {}), tenantId: orgId, isSuperAdmin: Boolean(current?.isSuperAdmin ?? true) }, fn);
+      }
+      if (!current?.tenantId && !current?.isSuperAdmin) {
+        return TenantContext.run({ isSuperAdmin: true }, fn);
+      }
+      return fn();
+    };
+
+    return runWithContext(async () => {
+      const res = await query("SELECT * FROM organization_members WHERE id = $1", [id]);
+      return res.rows.length > 0 ? mapRowToMember(res.rows[0]) : null;
+    });
   }
 
   async findByOrgAndUser(orgId: string, userId: string): Promise<OrganizationMemberEntity | null> {
-    return TenantContext.run({ isSuperAdmin: true }, async () => {
+    return TenantContext.run({ tenantId: orgId, isSuperAdmin: true }, async () => {
       const res = await query(
         "SELECT * FROM organization_members WHERE organization_id = $1 AND user_id = $2 AND status = 'ACTIVE'",
         [orgId, userId]
@@ -417,7 +432,11 @@ export class MembershipRepository implements IMembershipRepository {
     });
   }
 
-  async update(id: string, partial: Partial<OrganizationMemberEntity>): Promise<OrganizationMemberEntity> {
+  async update(
+    id: string,
+    partial: Partial<OrganizationMemberEntity>,
+    orgId?: string
+  ): Promise<OrganizationMemberEntity> {
     const setClauses: string[] = [];
     const params: any[] = [id];
     let idx = 2;
@@ -436,86 +455,122 @@ export class MembershipRepository implements IMembershipRepository {
     }
 
     if (setClauses.length === 0) {
-      const existing = await this.findById(id);
+      const existing = await this.findById(id, orgId);
       if (!existing) throw new Error(`Membro ${id} não encontrado.`);
       return existing;
     }
 
-    const sql = `UPDATE organization_members SET ${setClauses.join(", ")} WHERE id = $1 RETURNING *`;
-    const res = await query(sql, params);
-    if (res.rows.length === 0) throw new Error(`Membro ${id} não encontrado.`);
-    return mapRowToMember(res.rows[0]);
+    const current = TenantContext.get();
+    const runWithContext = <T>(fn: () => Promise<T>) => {
+      if (orgId && current?.tenantId !== orgId) {
+        return TenantContext.run({ ...(current ?? {}), tenantId: orgId, isSuperAdmin: Boolean(current?.isSuperAdmin ?? true) }, fn);
+      }
+      if (!current?.tenantId && !current?.isSuperAdmin) {
+        return TenantContext.run({ isSuperAdmin: true }, fn);
+      }
+      return fn();
+    };
+
+    return runWithContext(async () => {
+      const sql = `UPDATE organization_members SET ${setClauses.join(", ")} WHERE id = $1 RETURNING *`;
+      const res = await query(sql, params);
+      if (res.rows.length === 0) throw new Error(`Membro ${id} não encontrado.`);
+      return mapRowToMember(res.rows[0]);
+    });
   }
 }
 
 export class SubscriptionRepository implements ISubscriptionRepository {
+  private withSubContext<T>(orgId: string, fn: () => Promise<T>): Promise<T> {
+    const current = TenantContext.get();
+    if (current?.tenantId === orgId) {
+      return fn();
+    }
+    return TenantContext.run(
+      {
+        ...(current ?? {}),
+        tenantId: orgId,
+        isSuperAdmin: Boolean(current?.isSuperAdmin),
+      },
+      fn
+    );
+  }
+
   async findByOrgId(orgId: string): Promise<SubscriptionEntity | null> {
-    const res = await query("SELECT * FROM subscriptions WHERE organization_id = $1", [orgId]);
-    return res.rows.length > 0 ? mapRowToSubscription(res.rows[0]) : null;
+    return this.withSubContext(orgId, async () => {
+      const res = await query("SELECT * FROM subscriptions WHERE organization_id = $1", [orgId]);
+      return res.rows.length > 0 ? mapRowToSubscription(res.rows[0]) : null;
+    });
   }
 
   async create(sub: SubscriptionEntity): Promise<SubscriptionEntity> {
-    const res = await query(
-      `INSERT INTO subscriptions (
-        id, organization_id, plan_id, status, trial_started_at, trial_ends_at,
-        current_period_start, current_period_end, payment_method, auto_renew, created_at, updated_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
-      RETURNING *`,
-      [
-        sub.id,
-        sub.organizationId,
-        sub.planId,
-        sub.status,
-        sub.trialStartedAt,
-        sub.trialEndsAt,
-        sub.currentPeriodStart,
-        sub.currentPeriodEnd,
-        sub.paymentMethod,
-        sub.autoRenew,
-      ]
-    );
-    return mapRowToSubscription(res.rows[0]);
+    return this.withSubContext(sub.organizationId, async () => {
+      const res = await query(
+        `INSERT INTO subscriptions (
+          id, organization_id, plan_id, status, trial_started_at, trial_ends_at,
+          current_period_start, current_period_end, payment_method, auto_renew, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
+        RETURNING *`,
+        [
+          sub.id,
+          sub.organizationId,
+          sub.planId,
+          sub.status,
+          sub.trialStartedAt,
+          sub.trialEndsAt,
+          sub.currentPeriodStart,
+          sub.currentPeriodEnd,
+          sub.paymentMethod,
+          sub.autoRenew,
+        ]
+      );
+      return mapRowToSubscription(res.rows[0]);
+    });
   }
 
   async update(orgId: string, partial: Partial<SubscriptionEntity>): Promise<SubscriptionEntity> {
-    const setClauses: string[] = ["updated_at = NOW()"];
-    const params: any[] = [orgId];
-    let idx = 2;
+    return this.withSubContext(orgId, async () => {
+      const setClauses: string[] = ["updated_at = NOW()"];
+      const params: any[] = [orgId];
+      let idx = 2;
 
-    if (partial.planId !== undefined) {
-      setClauses.push(`plan_id = $${idx++}`);
-      params.push(partial.planId);
-    }
-    if (partial.status !== undefined) {
-      setClauses.push(`status = $${idx++}`);
-      params.push(partial.status);
-    }
-    if (partial.currentPeriodStart !== undefined) {
-      setClauses.push(`current_period_start = $${idx++}`);
-      params.push(partial.currentPeriodStart);
-    }
-    if (partial.currentPeriodEnd !== undefined) {
-      setClauses.push(`current_period_end = $${idx++}`);
-      params.push(partial.currentPeriodEnd);
-    }
-    if (partial.paymentMethod !== undefined) {
-      setClauses.push(`payment_method = $${idx++}`);
-      params.push(partial.paymentMethod);
-    }
-    if (partial.autoRenew !== undefined) {
-      setClauses.push(`auto_renew = $${idx++}`);
-      params.push(partial.autoRenew);
-    }
+      if (partial.planId !== undefined) {
+        setClauses.push(`plan_id = $${idx++}`);
+        params.push(partial.planId);
+      }
+      if (partial.status !== undefined) {
+        setClauses.push(`status = $${idx++}`);
+        params.push(partial.status);
+      }
+      if (partial.currentPeriodStart !== undefined) {
+        setClauses.push(`current_period_start = $${idx++}`);
+        params.push(partial.currentPeriodStart);
+      }
+      if (partial.currentPeriodEnd !== undefined) {
+        setClauses.push(`current_period_end = $${idx++}`);
+        params.push(partial.currentPeriodEnd);
+      }
+      if (partial.paymentMethod !== undefined) {
+        setClauses.push(`payment_method = $${idx++}`);
+        params.push(partial.paymentMethod);
+      }
+      if (partial.autoRenew !== undefined) {
+        setClauses.push(`auto_renew = $${idx++}`);
+        params.push(partial.autoRenew);
+      }
 
-    const sql = `UPDATE subscriptions SET ${setClauses.join(", ")} WHERE organization_id = $1 RETURNING *`;
-    const res = await query(sql, params);
-    if (res.rows.length === 0) throw new Error(`Assinatura para ${orgId} não encontrada.`);
-    return mapRowToSubscription(res.rows[0]);
+      const sql = `UPDATE subscriptions SET ${setClauses.join(", ")} WHERE organization_id = $1 RETURNING *`;
+      const res = await query(sql, params);
+      if (res.rows.length === 0) throw new Error(`Assinatura para ${orgId} não encontrada.`);
+      return mapRowToSubscription(res.rows[0]);
+    });
   }
 
   async listAll(): Promise<SubscriptionEntity[]> {
-    const res = await query("SELECT * FROM subscriptions ORDER BY created_at DESC");
-    return res.rows.map(mapRowToSubscription);
+    return TenantContext.run({ isSuperAdmin: true }, async () => {
+      const res = await query("SELECT * FROM subscriptions ORDER BY created_at DESC");
+      return res.rows.map(mapRowToSubscription);
+    });
   }
 }
 

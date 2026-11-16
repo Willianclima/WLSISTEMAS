@@ -2,7 +2,7 @@ import { Response, NextFunction } from "express";
 import pg from "pg";
 import { AuthenticatedRequest, authMiddleware } from "./authMiddleware";
 import { TenantContext } from "../db/tenantContext";
-import { getPostgresPool, setLocalTenantId, applyRlsContext } from "../db/postgres";
+import { executeWithTenantRlsContext, query, sanitizeTenantId } from "../db/postgres";
 import { memberRepo, orgRepo } from "../repositories";
 import { auditService } from "../services/auditService";
 
@@ -79,15 +79,28 @@ export async function tenantRlsMiddleware(
 
         // Auditoria obrigatória de suporte supervisionado de plataforma
         const reason = (req.headers["x-support-reason"] as string) || "Operação administrativa supervisionada";
-        await auditService.logAction(
-          verifiedTenantId,
-          user.id,
-          "SUPER_ADMIN_RLS_CONTEXT_ATTACHED",
-          "ORGANIZATION",
-          verifiedTenantId,
-          req.ip,
-          req.headers["user-agent"] as string,
-          `Super Admin (${user.email}) associou contexto RLS à loja ${verifiedTenantId}. Motivo: ${reason}`
+        await TenantContext.run(
+          {
+            tenantId: verifiedTenantId,
+            userId: user.id,
+            userEmail: user.email,
+            userRole: req.userRole,
+            ipAddress: req.ip || (req.headers["x-forwarded-for"] as string) || "127.0.0.1",
+            userAgent: (req.headers["user-agent"] as string) || "Aura Web Client",
+            isSuperAdmin: true,
+          },
+          async () => {
+            await auditService.logAction(
+              verifiedTenantId!,
+              user!.id,
+              "SUPER_ADMIN_RLS_CONTEXT_ATTACHED",
+              "ORGANIZATION",
+              verifiedTenantId!,
+              req.ip,
+              req.headers["user-agent"] as string,
+              `Super Admin (${user!.email}) associou contexto RLS à loja ${verifiedTenantId}. Motivo: ${reason}`
+            );
+          }
         );
       } else if (req.organizationId) {
         verifiedTenantId = req.organizationId;
@@ -137,56 +150,36 @@ export async function tenantRlsMiddleware(
     }
 
     const finalTenantId = verifiedTenantId || req.organizationId || "";
-    const sanitizedTenantId = finalTenantId.replace(/[^a-zA-Z0-9_\-]/g, "");
+    const sanitizedTenantId = sanitizeTenantId(finalTenantId, { allowEmpty: isSuperAdmin });
 
     // -------------------------------------------------------------------------
     // 2. ATRIBUIR HELPERS E DB CLIENT SCOPED AO OBJETO REQ
     // -------------------------------------------------------------------------
-    req.organizationId = finalTenantId;
+    req.organizationId = sanitizedTenantId;
 
-    // Helper para executar consultas transacionais onde SET LOCAL app.current_tenant_id é pré-injetado
     req.withTenantDb = async <T>(
       callback: (client: pg.PoolClient) => Promise<T>
     ): Promise<T> => {
-      const client = await getPostgresPool().connect();
-      try {
-        await client.query("BEGIN");
-        await setLocalTenantId(client, sanitizedTenantId, isSuperAdmin);
-        const result = await callback(client);
-        await client.query("COMMIT");
-        return result;
-      } catch (err) {
-        await client.query("ROLLBACK");
-        throw err;
-      } finally {
-        client.release();
-      }
+      return await executeWithTenantRlsContext(sanitizedTenantId, callback, isSuperAdmin);
     };
 
-    (req as any).executeWithRls = req.withTenantDb;
+    req.executeWithRls = req.withTenantDb;
 
-    // Consulta com injeção automática e segura de SET LOCAL
-    (req as any).scopedQuery = async <T extends pg.QueryResultRow = any>(
+    req.scopedQuery = async <T extends pg.QueryResultRow = any>(
       text: string,
       params?: any[]
     ): Promise<pg.QueryResult<T>> => {
-      const client = await getPostgresPool().connect();
-      try {
-        await applyRlsContext(client);
-        return await client.query<T>(text, params);
-      } finally {
-        try {
-          await client.query(
-            "SELECT set_config('app.current_tenant_id', '', false), set_config('app.is_super_admin', 'false', false)"
-          );
-        } catch {}
-        client.release();
-      }
+      return await query<T>(text, params, {
+        context: {
+          tenantId: sanitizedTenantId,
+          isSuperAdmin,
+        },
+      });
     };
 
     req.db = {
-      query: <T extends pg.QueryResultRow = any>(sql: string, params?: any[]) => (req as any).scopedQuery(sql, params),
-      withTransaction: <T>(callback: (client: pg.PoolClient) => Promise<T>) => req.withTenantDb!(callback),
+      query: <T extends pg.QueryResultRow = any>(sql: string, params?: any[]) => req.scopedQuery!<T>(sql, params),
+      withTransaction: <T>(callback: (client: pg.PoolClient) => Promise<T>) => req.withTenantDb!<T>(callback),
     };
 
     // -------------------------------------------------------------------------

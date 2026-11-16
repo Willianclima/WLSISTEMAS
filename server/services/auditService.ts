@@ -1,5 +1,5 @@
 import { AuditLogEntity } from "../types/saas";
-import { query } from "../db/postgres";
+import { PgPoolClientLike, query } from "../db/postgres";
 import { TenantContext } from "../db/tenantContext";
 
 export interface AuditContextParams {
@@ -115,7 +115,11 @@ class AuditService {
     userAgent?: string,
     details?: string,
     changes?: any,
-    options?: { requirePersistence?: boolean }
+    options?: {
+      requirePersistence?: boolean;
+      tx?: { pgClient?: PgPoolClientLike };
+      client?: PgPoolClientLike;
+    }
   ): Promise<AuditLogEntity> {
     const id = `aud-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     const sanitizedDetails = details ? this.maskSensitiveData(details) : undefined;
@@ -139,33 +143,55 @@ class AuditService {
       createdAt: nowIso.replace("T", " ").substring(0, 16),
     };
 
-    // Store in-memory buffer
-    this.inMemoryLogs.unshift(log);
-    if (this.inMemoryLogs.length > 500) {
-      this.inMemoryLogs = this.inMemoryLogs.slice(0, 500);
-    }
+    const pushInMemory = () => {
+      this.inMemoryLogs.unshift(log);
+      if (this.inMemoryLogs.length > 500) {
+        this.inMemoryLogs = this.inMemoryLogs.slice(0, 500);
+      }
+    };
 
-    // Persist in PostgreSQL
+    // Persist in PostgreSQL (preferring active transaction client for single-connection atomicity)
     try {
       const validUserId = userId && typeof userId === "string" && userId.startsWith("usr-") ? userId : null;
-      await query(
-        `INSERT INTO audit_logs (id, organization_id, user_id, action, entity, entity_id, status, ip_address, user_agent, details, changes, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-        [
-          id,
-          organizationId,
-          validUserId,
-          action,
-          entity || null,
-          entityId || null,
-          "SUCESSO",
-          ipAddress || "127.0.0.1",
-          userAgent || "Aura Core Service",
-          sanitizedDetails || null,
-          sanitizedChanges ? JSON.stringify(sanitizedChanges) : null,
-          nowIso,
-        ]
-      );
+      const sql = `INSERT INTO audit_logs (id, organization_id, user_id, action, entity, entity_id, status, ip_address, user_agent, details, changes, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`;
+      const params = [
+        id,
+        organizationId,
+        validUserId,
+        action,
+        entity || null,
+        entityId || null,
+        "SUCESSO",
+        ipAddress || "127.0.0.1",
+        userAgent || "Aura Core Service",
+        sanitizedDetails || null,
+        sanitizedChanges ? JSON.stringify(sanitizedChanges) : null,
+        nowIso,
+      ];
+
+      const txClient = options?.client ?? options?.tx?.pgClient;
+      if (txClient) {
+        await txClient.query(sql, params);
+      } else {
+        const currentCtx = TenantContext.get();
+        const needsExplicitContext =
+          !currentCtx ||
+          (organizationId && currentCtx.tenantId !== organizationId);
+        await query(
+          sql,
+          params,
+          needsExplicitContext && organizationId
+            ? {
+                context: {
+                  tenantId: organizationId,
+                  isSuperAdmin: Boolean(currentCtx?.isSuperAdmin),
+                },
+              }
+            : {}
+        );
+      }
+      pushInMemory();
     } catch (dbErr: any) {
       if (isCritical) {
         console.error(
@@ -177,6 +203,7 @@ class AuditService {
         );
       }
 
+      pushInMemory();
       console.warn("Falha ao gravar audit_logs no PostgreSQL (salvo em memória para ação não crítica):", dbErr);
     }
 

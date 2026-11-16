@@ -1,14 +1,12 @@
 import { Response, NextFunction } from "express";
-import crypto from "crypto";
 import pg from "pg";
 import { AuthenticatedRequest } from "./authMiddleware";
 import { JwtService, TenantJwtPayload } from "../services/jwtService";
-import { getSessionSecret } from "../config/authConfig";
 import { userRepo, orgRepo, memberRepo } from "../repositories";
 import { TenantContext } from "../db/tenantContext";
-import { getPostgresPool, setLocalTenantId, applyRlsContext } from "../db/postgres";
+import { executeWithTenantRlsContext, query, RlsContextError, sanitizeTenantId } from "../db/postgres";
 import { auditService } from "../services/auditService";
-import { UserEntity, OrganizationEntity, OrganizationRole } from "../types/saas";
+import { UserEntity, OrganizationRole } from "../types/saas";
 import { isProduction } from "../config/environment";
 
 /**
@@ -111,7 +109,16 @@ export async function jwtTenantRlsMiddleware(
 
     // Se a requisição contiver cabeçalho 'x-tenant-id' ou 'tenantId', validamos contra tentativa de spoofing
     if (tenantHeader && tenantHeader.trim()) {
-      const sanitizedHeaderTenant = tenantHeader.trim().replace(/[^a-zA-Z0-9_\-]/g, "");
+      let sanitizedHeaderTenant: string;
+      try {
+        sanitizedHeaderTenant = sanitizeTenantId(tenantHeader.trim());
+      } catch {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_TENANT_ID",
+          error: "Identificador de organização inválido no cabeçalho da requisição.",
+        });
+      }
 
       // Se o cabeçalho tentar sobrescrever o tenant do JWT:
       if (targetTenantId && sanitizedHeaderTenant !== targetTenantId) {
@@ -129,15 +136,27 @@ export async function jwtTenantRlsMiddleware(
         } else if (isSuperAdmin) {
           // P0 CONTROLLED SUPPORT: Super Admin NÃO tem passe livre automático.
           // Deve obrigatoriamente iniciar sessão de suporte escopada com motivo e auditoria.
-          await auditService.logAction(
-            sanitizedHeaderTenant,
-            user.id,
-            "SUPER_ADMIN_UNAUTHORIZED_DIRECT_TENANT_ACCESS_BLOCKED",
-            "ORGANIZATION",
-            sanitizedHeaderTenant,
-            req.ip,
-            req.headers["user-agent"] as string,
-            `Super Admin (${user.email}) tentou acessar tenant '${sanitizedHeaderTenant}' via cabeçalho direto sem sessão de suporte auditada. Bloqueado.`
+          await TenantContext.run(
+            {
+              tenantId: sanitizedHeaderTenant,
+              userId: user.id,
+              userEmail: user.email,
+              ipAddress: req.ip || (req.headers["x-forwarded-for"] as string) || "127.0.0.1",
+              userAgent: (req.headers["user-agent"] as string) || "Aura Web Client",
+              isSuperAdmin: true,
+            },
+            async () => {
+              await auditService.logAction(
+                sanitizedHeaderTenant,
+                user!.id,
+                "SUPER_ADMIN_UNAUTHORIZED_DIRECT_TENANT_ACCESS_BLOCKED",
+                "ORGANIZATION",
+                sanitizedHeaderTenant,
+                req.ip,
+                req.headers["user-agent"] as string,
+                `Super Admin (${user!.email}) tentou acessar tenant '${sanitizedHeaderTenant}' via cabeçalho direto sem sessão de suporte auditada. Bloqueado.`
+              );
+            }
           );
 
           return res.status(403).json({
@@ -146,19 +165,31 @@ export async function jwtTenantRlsMiddleware(
             error: `Acesso negado: Administradores da plataforma devem iniciar uma sessão de suporte técnico controlada com motivo obrigatório e auditoria em PostgreSQL para acessar os dados da organização '${sanitizedHeaderTenant}'.`,
           });
         } else {
-          await auditService.logAction(
-            sanitizedHeaderTenant,
-            user.id,
-            "SECURITY_UNAUTHORIZED_TENANT_ACCESS",
-            "RLS_BARRIER",
-            targetTenantId || "unknown",
-            req.ip,
-            req.headers["user-agent"] as string,
-            JSON.stringify({
-              jwtTenantId: targetTenantId,
-              attemptedTenantId: sanitizedHeaderTenant,
-              reason: "Spoofing attempt blocked: user has no active membership in target organization",
-            })
+          await TenantContext.run(
+            {
+              tenantId: sanitizedHeaderTenant,
+              userId: user.id,
+              userEmail: user.email,
+              ipAddress: req.ip || (req.headers["x-forwarded-for"] as string) || "127.0.0.1",
+              userAgent: (req.headers["user-agent"] as string) || "Aura Web Client",
+              isSuperAdmin: false,
+            },
+            async () => {
+              await auditService.logAction(
+                sanitizedHeaderTenant,
+                user!.id,
+                "SECURITY_UNAUTHORIZED_TENANT_ACCESS",
+                "RLS_BARRIER",
+                targetTenantId || "unknown",
+                req.ip,
+                req.headers["user-agent"] as string,
+                JSON.stringify({
+                  jwtTenantId: targetTenantId,
+                  attemptedTenantId: sanitizedHeaderTenant,
+                  reason: "Spoofing attempt blocked: user has no active membership in target organization",
+                })
+              );
+            }
           );
 
           return res.status(403).json({
@@ -194,8 +225,19 @@ export async function jwtTenantRlsMiddleware(
       });
     }
 
-    // Sanitiza contra SQL injection e caracteres maliciosos
-    const validatedTenantId = targetTenantId.replace(/[^a-zA-Z0-9_\-]/g, "");
+    let validatedTenantId: string;
+    try {
+      validatedTenantId = sanitizeTenantId(targetTenantId);
+    } catch (err) {
+      if (err instanceof RlsContextError) {
+        return res.status(400).json({
+          success: false,
+          code: "INVALID_TENANT_ID",
+          error: err.message,
+        });
+      }
+      throw err;
+    }
 
     // Validação estrita do Membership da identidade no banco de dados
     const membership = await memberRepo.findByOrgAndUser(validatedTenantId, user.id);
@@ -265,25 +307,12 @@ export async function jwtTenantRlsMiddleware(
     };
 
     // -------------------------------------------------------------------------
-    // 5. INJEÇÃO DE CLIENT HELPERS COM 'SET LOCAL app.current_tenant_id = ?'
+    // 5. INJEÇÃO DE CLIENT HELPERS TRANSACIONAIS COM 'set_config(..., true)'
     // -------------------------------------------------------------------------
     req.withTenantDb = async <T>(
       callback: (client: pg.PoolClient) => Promise<T>
     ): Promise<T> => {
-      const client = await getPostgresPool().connect();
-      try {
-        await client.query("BEGIN");
-        // Executa explicitamente SET LOCAL app.current_tenant_id = '...' antes de qualquer query
-        await setLocalTenantId(client, validatedTenantId, isSuperAdmin);
-        const result = await callback(client);
-        await client.query("COMMIT");
-        return result;
-      } catch (err) {
-        await client.query("ROLLBACK");
-        throw err;
-      } finally {
-        client.release();
-      }
+      return await executeWithTenantRlsContext(validatedTenantId, callback, isSuperAdmin);
     };
     req.executeWithRls = req.withTenantDb;
 
@@ -291,25 +320,12 @@ export async function jwtTenantRlsMiddleware(
       text: string,
       params?: any[]
     ): Promise<pg.QueryResult<T>> => {
-      const client = await getPostgresPool().connect();
-      try {
-        await client.query(
-          "SELECT set_config('app.current_tenant_id', $1, false), set_config('app.is_super_admin', $2, false)",
-          [validatedTenantId, isSuperAdmin ? "true" : "false"]
-        );
-        try {
-          await client.query(`SET LOCAL app.current_tenant_id = '${validatedTenantId}'`);
-          await client.query(`SET LOCAL app.is_super_admin = '${isSuperAdmin ? "true" : "false"}'`);
-        } catch {}
-        return await client.query<T>(text, params);
-      } finally {
-        try {
-          await client.query(
-            "SELECT set_config('app.current_tenant_id', '', false), set_config('app.is_super_admin', 'false', false)"
-          );
-        } catch {}
-        client.release();
-      }
+      return await query<T>(text, params, {
+        context: {
+          tenantId: validatedTenantId,
+          isSuperAdmin,
+        },
+      });
     };
 
     req.db = {

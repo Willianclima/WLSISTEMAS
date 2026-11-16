@@ -4,6 +4,7 @@ import { InventoryConcurrencyService } from "./inventoryConcurrency.service";
 import { auditService } from "../../services/auditService";
 import { InventoryReservationEntity } from "./inventory.types";
 import { TenantContext } from "../../db/tenantContext";
+import { UnitOfWork, TransactionContext } from "../../db/transaction";
 
 export interface ReservationExpiryWorkerConfig {
   /** Polling interval in milliseconds (default: 30000ms = 30s) */
@@ -213,7 +214,7 @@ export class ReservationExpiryWorker {
       if (targetOrgId) {
         orgIds.add(targetOrgId);
       } else {
-        const orgs = await orgRepo.listAll();
+        const orgs = await TenantContext.run({ isSuperAdmin: true }, () => orgRepo.listAll());
         for (const org of orgs) {
           orgIds.add(org.id);
         }
@@ -334,70 +335,65 @@ export class ReservationExpiryWorker {
       ];
 
       const releaseLock = await InventoryConcurrencyService.lockManager.acquireLocks(lockKeys);
-      let balanceReleased = false;
-      let releasedQuantity = 0;
 
       try {
-        // Re-verificar status sob lock para evitar concorrência com pagamento simultâneo
-        const fresh = await inventoryRepo.findReservationById(orgId, resId);
-        if (!fresh || fresh.status !== "ACTIVE") {
-          continue;
-        }
-
-        if (new Date(fresh.expiresAt).getTime() > Date.now()) {
-          continue;
-        }
-
-        // 1. Decrementa reserved_quantity
-        // Se o saldo já tiver reservedQuantity menor que a quantidade da reserva (ou 0),
-        // liberamos apenas a quantidade efetivamente reservada no saldo para evitar erro de saldo insuficiente.
-        const currentBal = await inventoryRepo.getBalance(orgId, fresh.productId, fresh.locationId);
-        if (currentBal && currentBal.reservedQuantity > 0) {
-          const qtyToRelease = Math.min(fresh.quantity, currentBal.reservedQuantity);
-          await inventoryRepo.releaseReservation(orgId, fresh.productId, fresh.locationId, qtyToRelease);
-          balanceReleased = true;
-          releasedQuantity = qtyToRelease;
-        }
-
-        // 2. Atualiza registro na tabela inventory_reservations para EXPIRED
-        const updated = await inventoryRepo.updateReservationStatus(orgId, resId, "EXPIRED", {
-          releasedAt: new Date().toISOString(),
-          notes: `${fresh.notes || ""} [Expirada automaticamente pelo Background Worker (TTL excedido)]`.trim(),
-        });
-
-        // 3. Registra auditoria transacional
-        await auditService.logAction(
-          orgId,
-          undefined,
-          "RESERVATION_TTL_EXPIRED",
-          fresh.referenceType,
-          fresh.referenceId,
-          "127.0.0.1",
-          "ReservationExpiryWorker",
-          `Reserva #${fresh.id} expirou por TTL. ${fresh.quantity} un devolvidas ao saldo disponível.`,
-          {
-            reservationId: fresh.id,
-            productId: fresh.productId,
-            locationId: fresh.locationId,
-            quantity: fresh.quantity,
-            expiresAt: fresh.expiresAt,
+        const updated = await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+          // Re-verificar status sob lock para evitar concorrência com pagamento simultâneo
+          const fresh = await inventoryRepo.findReservationById(orgId, resId, tx);
+          if (!fresh || fresh.status !== "ACTIVE") {
+            return null;
           }
-        );
+
+          if (new Date(fresh.expiresAt).getTime() > Date.now()) {
+            return null;
+          }
+
+          // 1. Decrementa reserved_quantity usando lock de linha
+          const currentBal = await inventoryRepo.getBalance(orgId, fresh.productId, fresh.locationId, tx);
+          if (currentBal && currentBal.reservedQuantity > 0) {
+            const qtyToRelease = Math.min(fresh.quantity, currentBal.reservedQuantity);
+            await inventoryRepo.releaseReservation(orgId, fresh.productId, fresh.locationId, qtyToRelease, tx);
+          }
+
+          // 2. Atualiza registro na tabela inventory_reservations para EXPIRED
+          const resUpdated = await inventoryRepo.updateReservationStatus(
+            orgId,
+            resId,
+            "EXPIRED",
+            {
+              releasedAt: new Date().toISOString(),
+              notes: `${fresh.notes || ""} [Expirada automaticamente pelo Background Worker (TTL excedido)]`.trim(),
+            },
+            tx
+          );
+
+          // 3. Registra auditoria transacional
+          await auditService.logAction(
+            orgId,
+            undefined,
+            "RESERVATION_TTL_EXPIRED",
+            fresh.referenceType,
+            fresh.referenceId,
+            "127.0.0.1",
+            "ReservationExpiryWorker",
+            `Reserva #${fresh.id} expirou por TTL. ${fresh.quantity} un devolvidas ao saldo disponível.`,
+            {
+              reservationId: fresh.id,
+              productId: fresh.productId,
+              locationId: fresh.locationId,
+              quantity: fresh.quantity,
+              expiresAt: fresh.expiresAt,
+            },
+            { tx }
+          );
+
+          return resUpdated;
+        });
 
         if (updated) {
           expiredProcessed.push(updated);
         }
       } catch (err: any) {
-        if (balanceReleased && releasedQuantity > 0) {
-          try {
-            const checkBal = await inventoryRepo.getBalance(orgId, current.productId, current.locationId);
-            if (checkBal && (checkBal.onHandQuantity - checkBal.reservedQuantity) >= releasedQuantity) {
-              await inventoryRepo.reserveStock(orgId, current.productId, current.locationId, releasedQuantity);
-            }
-          } catch (rbErr) {
-            console.error(`[ROLLBACK_ERROR] Falha ao reverter expiração de reserva:`, rbErr);
-          }
-        }
         console.error(`[ReservationExpiryWorker] Erro ao expirar reserva #${resId}:`, err.message);
       } finally {
         releaseLock();
@@ -462,95 +458,105 @@ export class ReservationExpiryWorker {
       const releaseLock = await InventoryConcurrencyService.lockManager.acquireLocks([lockKey]);
 
       try {
-        let bal = await inventoryRepo.getBalance(orgId, productId, locationId);
-        if (!bal) {
-          if (expectedReserved > 0) {
-            // Cria registro se houver reservas ativas órfãs
-            bal = {
-              id: `bal-${productId}-${locationId}`,
+        const reconciled = await UnitOfWork.transaction(
+          orgId,
+          async (tx: TransactionContext): Promise<ReconciledBalanceRecord | null> => {
+            let bal = await inventoryRepo.getBalance(orgId, productId, locationId, tx);
+            if (!bal) {
+              if (expectedReserved > 0) {
+                bal = {
+                  id: `bal-${productId}-${locationId}`,
+                  organizationId: orgId,
+                  productId,
+                  locationId,
+                  onHandQuantity: expectedReserved,
+                  reservedQuantity: expectedReserved,
+                  availableQuantity: 0,
+                  createdAt: new Date().toISOString(),
+                  updatedAt: new Date().toISOString(),
+                };
+                await inventoryRepo.upsertBalance(bal, tx);
+                return {
+                  organizationId: orgId,
+                  productId,
+                  locationId,
+                  previousReserved: 0,
+                  calculatedActiveSum: expectedReserved,
+                  divergenceFound: true,
+                  corrected: true,
+                  onHandQuantity: bal.onHandQuantity,
+                  newReservedQuantity: expectedReserved,
+                  newAvailableQuantity: 0,
+                };
+              }
+              return null;
+            }
+
+            // Lock existing row via FOR UPDATE before checking/repairing divergence
+            const lockedBal = (await inventoryRepo.getBalanceForUpdate(orgId, productId, locationId, tx)) || bal;
+            const prevReserved = lockedBal.reservedQuantity;
+            const clampedExpectedReserved = Math.max(0, Math.min(expectedReserved, lockedBal.onHandQuantity));
+            const divergenceFound =
+              prevReserved !== clampedExpectedReserved ||
+              lockedBal.availableQuantity !== (lockedBal.onHandQuantity - clampedExpectedReserved);
+
+            if (divergenceFound) {
+              const newReserved = clampedExpectedReserved;
+              const newAvailable = Math.max(0, lockedBal.onHandQuantity - newReserved);
+
+              const correctedBal = {
+                ...lockedBal,
+                reservedQuantity: newReserved,
+                availableQuantity: newAvailable,
+                updatedAt: new Date().toISOString(),
+              };
+
+              await inventoryRepo.upsertBalance(correctedBal, tx);
+
+              await auditService.logAction(
+                orgId,
+                undefined,
+                "INVENTORY_RECONCILIATION_REPAIR",
+                "RESERVATION_TABLE",
+                `bal-${productId}-${locationId}`,
+                "127.0.0.1",
+                "ReservationExpiryWorker",
+                `Reconciliação automática: divergência reparada em (${productId}, ${locationId}). Reservado anterior: ${prevReserved}, Corrigido: ${newReserved}. Disponível: ${newAvailable}.`,
+                { productId, locationId, previousReserved: prevReserved, newReserved, onHandQuantity: lockedBal.onHandQuantity },
+                { tx }
+              );
+
+              return {
+                organizationId: orgId,
+                productId,
+                locationId,
+                previousReserved: prevReserved,
+                calculatedActiveSum: expectedReserved,
+                divergenceFound: true,
+                corrected: true,
+                onHandQuantity: lockedBal.onHandQuantity,
+                newReservedQuantity: newReserved,
+                newAvailableQuantity: newAvailable,
+              };
+            }
+
+            return {
               organizationId: orgId,
               productId,
               locationId,
-              onHandQuantity: expectedReserved,
-              reservedQuantity: expectedReserved,
-              availableQuantity: 0,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-            };
-            await inventoryRepo.upsertBalance(bal);
-            results.push({
-              organizationId: orgId,
-              productId,
-              locationId,
-              previousReserved: 0,
+              previousReserved: prevReserved,
               calculatedActiveSum: expectedReserved,
-              divergenceFound: true,
-              corrected: true,
-              onHandQuantity: bal.onHandQuantity,
-              newReservedQuantity: expectedReserved,
-              newAvailableQuantity: 0,
-            });
+              divergenceFound: false,
+              corrected: false,
+              onHandQuantity: lockedBal.onHandQuantity,
+              newReservedQuantity: lockedBal.reservedQuantity,
+              newAvailableQuantity: lockedBal.availableQuantity,
+            };
           }
-          continue;
-        }
+        );
 
-        const prevReserved = bal.reservedQuantity;
-        // O valor reservado NUNCA pode exceder onHandQuantity (regra do PostgreSQL CHECK reserved_quantity <= on_hand_quantity)
-        const clampedExpectedReserved = Math.max(0, Math.min(expectedReserved, bal.onHandQuantity));
-        const divergenceFound =
-          prevReserved !== clampedExpectedReserved ||
-          bal.availableQuantity !== (bal.onHandQuantity - clampedExpectedReserved);
-
-        if (divergenceFound) {
-          const newReserved = clampedExpectedReserved;
-          const newAvailable = Math.max(0, bal.onHandQuantity - newReserved);
-
-          const correctedBal = {
-            ...bal,
-            reservedQuantity: newReserved,
-            availableQuantity: newAvailable,
-            updatedAt: new Date().toISOString(),
-          };
-
-          await inventoryRepo.upsertBalance(correctedBal);
-
-          await auditService.logAction(
-            orgId,
-            undefined,
-            "INVENTORY_RECONCILIATION_REPAIR",
-            "RESERVATION_TABLE",
-            `bal-${productId}-${locationId}`,
-            "127.0.0.1",
-            "ReservationExpiryWorker",
-            `Reconciliação automática: divergência reparada em (${productId}, ${locationId}). Reservado anterior: ${prevReserved}, Corrigido: ${newReserved}. Disponível: ${newAvailable}.`,
-            { productId, locationId, previousReserved: prevReserved, newReserved, onHandQuantity: bal.onHandQuantity }
-          );
-
-          results.push({
-            organizationId: orgId,
-            productId,
-            locationId,
-            previousReserved: prevReserved,
-            calculatedActiveSum: expectedReserved,
-            divergenceFound: true,
-            corrected: true,
-            onHandQuantity: bal.onHandQuantity,
-            newReservedQuantity: newReserved,
-            newAvailableQuantity: newAvailable,
-          });
-        } else {
-          results.push({
-            organizationId: orgId,
-            productId,
-            locationId,
-            previousReserved: prevReserved,
-            calculatedActiveSum: expectedReserved,
-            divergenceFound: false,
-            corrected: false,
-            onHandQuantity: bal.onHandQuantity,
-            newReservedQuantity: bal.reservedQuantity,
-            newAvailableQuantity: bal.availableQuantity,
-          });
+        if (reconciled) {
+          results.push(reconciled);
         }
       } catch (recErr: any) {
         console.error(`[ReservationExpiryWorker] Erro ao reconciliar saldo ${key}:`, recErr);

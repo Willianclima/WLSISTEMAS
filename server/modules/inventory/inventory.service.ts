@@ -1,6 +1,7 @@
 import { inventoryRepo } from "./inventory.repository";
 import { InventoryConcurrencyService } from "./inventoryConcurrency.service";
 import { reservationExpiryWorker } from "./reservationExpiryWorker";
+import { UnitOfWork, TransactionContext } from "../../db/transaction";
 import {
   InventoryMovementEntity,
   CreateMovementDTO,
@@ -198,166 +199,166 @@ export class InventoryService {
       throw new Error("A quantidade movimentada não pode ser zero.");
     }
 
-    // Determine target location (default to Matriz if none provided)
-    let locationId = dto.locationId;
-    if (!locationId) {
-      const locations = await inventoryRepo.listLocations(orgId);
-      const defaultLoc = locations.find((l) => l.type === "HEADQUARTERS" || l.code === "MATRIZ") || locations[0];
-      locationId = defaultLoc ? defaultLoc.id : "loc-lumina-matriz";
-    }
+    return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+      // Determine target location (default to Matriz if none provided)
+      let locationId = dto.locationId;
+      if (!locationId) {
+        const locations = await inventoryRepo.listLocations(orgId, tx);
+        const defaultLoc = locations.find((l) => l.type === "HEADQUARTERS" || l.code === "MATRIZ") || locations[0];
+        locationId = defaultLoc ? defaultLoc.id : "loc-lumina-matriz";
+      }
 
-    const currentStock = await inventoryRepo.getStockSummary(orgId, productId);
-    let newPhysical = currentStock.stockPhysical;
-    let newConsigned = currentStock.stockConsigned;
-    const absQty = Math.abs(quantityChange);
+      const currentStock = await inventoryRepo.getStockSummary(orgId, productId, tx);
+      let newPhysical = currentStock.stockPhysical;
+      let newConsigned = currentStock.stockConsigned;
+      const absQty = Math.abs(quantityChange);
 
-    // Pre-validation
-    if (type === "CONSIGNMENT_OUT" && newPhysical < absQty) {
-      throw new Error(
-        `Saldo físico insuficiente (${newPhysical} un) para enviar ${absQty} un em consignação.`
-      );
-    }
+      // Pre-validation
+      if (type === "CONSIGNMENT_OUT" && newPhysical < absQty) {
+        throw new Error(
+          `Saldo físico insuficiente (${newPhysical} un) para enviar ${absQty} un em consignação.`
+        );
+      }
 
-    // 1. Generate & Insert Ledger Movement First (Source of Truth Event)
-    const movementId = `mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
-    const movement: InventoryMovementEntity = {
-      id: movementId,
-      organizationId: orgId,
-      productId,
-      locationId,
-      type,
-      quantityChange,
-      physicalBalanceAfter: Math.max(0, newPhysical),
-      consignedBalanceAfter: Math.max(0, newConsigned),
-      onHandAfter: currentStock.onHandTotal,
-      reservedAfter: currentStock.reservedTotal,
-      availableAfter: currentStock.availableTotal,
-      referenceType: referenceType || "MANUAL_ADJUSTMENT",
-      referenceId,
-      reversalOfMovementId: dto.reversalOfMovementId,
-      operatorName: operatorName || "Gestão Matriz (Sistema)",
-      notes: notes || `Movimentação ${type} de ${quantityChange} un registrada.`,
-      createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
-    };
+      // 1. Generate & Stage Ledger Movement First (Source of Truth Event)
+      const movementId = `mov-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+      const movement: InventoryMovementEntity = {
+        id: movementId,
+        organizationId: orgId,
+        productId,
+        locationId,
+        type,
+        quantityChange,
+        physicalBalanceAfter: Math.max(0, newPhysical),
+        consignedBalanceAfter: Math.max(0, newConsigned),
+        onHandAfter: currentStock.onHandTotal,
+        reservedAfter: currentStock.reservedTotal,
+        availableAfter: currentStock.availableTotal,
+        referenceType: referenceType || "MANUAL_ADJUSTMENT",
+        referenceId,
+        reversalOfMovementId: dto.reversalOfMovementId,
+        operatorName: operatorName || "Gestão Matriz (Sistema)",
+        notes: notes || `Movimentação ${type} de ${quantityChange} un registrada.`,
+        createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+      };
 
-    await inventoryRepo.createMovement(movement);
+      await inventoryRepo.createMovement(movement, tx);
 
-    // 2. Project into inventory_balances with rollback safety
-    try {
-      switch (type) {
-        case "PURCHASE":
-        case "RETURN":
-          newPhysical += absQty;
-          await inventoryRepo.adjustOnHand(orgId, productId, locationId, absQty);
-          break;
+      // 2. Project into inventory_balances inside the same PostgreSQL transaction
+      try {
+        switch (type) {
+          case "PURCHASE":
+          case "RETURN":
+            newPhysical += absQty;
+            await inventoryRepo.adjustOnHand(orgId, productId, locationId, absQty, tx);
+            break;
 
-        case "SALE":
-          newPhysical -= absQty;
-          await inventoryRepo.adjustOnHand(orgId, productId, locationId, -absQty);
-          break;
+          case "SALE":
+            newPhysical -= absQty;
+            await inventoryRepo.adjustOnHand(orgId, productId, locationId, -absQty, tx);
+            break;
 
-        case "CONSIGNMENT_OUT": {
-          newPhysical -= absQty;
-          newConsigned += absQty;
+          case "CONSIGNMENT_OUT": {
+            newPhysical -= absQty;
+            newConsigned += absQty;
 
-          const locations = await inventoryRepo.listLocations(orgId);
-          const originLoc = locations.find((l) => l.id === locationId) || locations[0];
-          const targetBag = locations.find((l) => l.type === "RESELLER_BAG") || originLoc;
+            const locations = await inventoryRepo.listLocations(orgId, tx);
+            const originLoc = locations.find((l) => l.id === locationId) || locations[0];
+            const targetBag = locations.find((l) => l.type === "RESELLER_BAG") || originLoc;
 
-          await inventoryRepo.adjustOnHand(orgId, productId, originLoc.id, -absQty);
-          await inventoryRepo.adjustOnHand(orgId, productId, targetBag.id, absQty);
-          break;
-        }
+            await inventoryRepo.adjustOnHand(orgId, productId, originLoc.id, -absQty, tx);
+            await inventoryRepo.adjustOnHand(orgId, productId, targetBag.id, absQty, tx);
+            break;
+          }
 
-        case "CONSIGNMENT_RETURN": {
-          newConsigned = Math.max(0, newConsigned - absQty);
-          newPhysical += absQty;
+          case "CONSIGNMENT_RETURN": {
+            newConsigned = Math.max(0, newConsigned - absQty);
+            newPhysical += absQty;
 
-          const locations = await inventoryRepo.listLocations(orgId);
-          const bagLoc = locations.find((l) => l.type === "RESELLER_BAG") || locations[0];
-          const matrizLoc = locations.find((l) => l.type === "HEADQUARTERS" || l.code === "MATRIZ") || locations[0];
+            const locations = await inventoryRepo.listLocations(orgId, tx);
+            const bagLoc = locations.find((l) => l.type === "RESELLER_BAG") || locations[0];
+            const matrizLoc = locations.find((l) => l.type === "HEADQUARTERS" || l.code === "MATRIZ") || locations[0];
 
-          await inventoryRepo.adjustOnHand(orgId, productId, bagLoc.id, -absQty);
-          await inventoryRepo.adjustOnHand(orgId, productId, matrizLoc.id, absQty);
-          break;
-        }
+            await inventoryRepo.adjustOnHand(orgId, productId, bagLoc.id, -absQty, tx);
+            await inventoryRepo.adjustOnHand(orgId, productId, matrizLoc.id, absQty, tx);
+            break;
+          }
 
-        case "CONSIGNMENT_SALE": {
-          newConsigned = Math.max(0, newConsigned - absQty);
-          const locations = await inventoryRepo.listLocations(orgId);
-          const bagLoc = locations.find((l) => l.id === locationId || l.type === "RESELLER_BAG") || locations[0];
-          await inventoryRepo.adjustOnHand(orgId, productId, bagLoc.id, -absQty);
-          break;
-        }
+          case "CONSIGNMENT_SALE": {
+            newConsigned = Math.max(0, newConsigned - absQty);
+            const locations = await inventoryRepo.listLocations(orgId, tx);
+            const bagLoc = locations.find((l) => l.id === locationId || l.type === "RESELLER_BAG") || locations[0];
+            await inventoryRepo.adjustOnHand(orgId, productId, bagLoc.id, -absQty, tx);
+            break;
+          }
 
-        case "ADJUSTMENT":
-        case "TRANSFER":
-          newPhysical += quantityChange;
-          await inventoryRepo.adjustOnHand(orgId, productId, locationId, quantityChange);
-          break;
+          case "ADJUSTMENT":
+          case "TRANSFER":
+            newPhysical += quantityChange;
+            await inventoryRepo.adjustOnHand(orgId, productId, locationId, quantityChange, tx);
+            break;
 
-        case "REVERSAL":
-          if (dto.reversalOfMovementId) {
-            const orig = await inventoryRepo.findById(orgId, dto.reversalOfMovementId);
-            if (orig) {
-              const origQty = Math.abs(orig.quantityChange);
-              switch (orig.type) {
-                case "PURCHASE":
-                case "RETURN":
-                  newPhysical -= origQty;
-                  await inventoryRepo.adjustOnHand(orgId, productId, locationId, -origQty);
-                  break;
-                case "SALE":
-                  newPhysical += origQty;
-                  await inventoryRepo.adjustOnHand(orgId, productId, locationId, origQty);
-                  break;
-                case "CONSIGNMENT_OUT":
-                  newPhysical += origQty;
-                  newConsigned = Math.max(0, newConsigned - origQty);
-                  await inventoryRepo.adjustOnHand(orgId, productId, locationId, origQty);
-                  break;
-                case "CONSIGNMENT_RETURN":
-                  newPhysical = Math.max(0, newPhysical - origQty);
-                  newConsigned += origQty;
-                  await inventoryRepo.adjustOnHand(orgId, productId, locationId, -origQty);
-                  break;
-                case "CONSIGNMENT_SALE":
-                  newConsigned += origQty;
-                  await inventoryRepo.adjustOnHand(orgId, productId, locationId, origQty);
-                  break;
-                default:
-                  newPhysical += quantityChange;
-                  await inventoryRepo.adjustOnHand(orgId, productId, locationId, quantityChange);
-                  break;
+          case "REVERSAL":
+            if (dto.reversalOfMovementId) {
+              const orig = await inventoryRepo.findById(orgId, dto.reversalOfMovementId, tx);
+              if (orig) {
+                const origQty = Math.abs(orig.quantityChange);
+                switch (orig.type) {
+                  case "PURCHASE":
+                  case "RETURN":
+                    newPhysical -= origQty;
+                    await inventoryRepo.adjustOnHand(orgId, productId, locationId, -origQty, tx);
+                    break;
+                  case "SALE":
+                    newPhysical += origQty;
+                    await inventoryRepo.adjustOnHand(orgId, productId, locationId, origQty, tx);
+                    break;
+                  case "CONSIGNMENT_OUT":
+                    newPhysical += origQty;
+                    newConsigned = Math.max(0, newConsigned - origQty);
+                    await inventoryRepo.adjustOnHand(orgId, productId, locationId, origQty, tx);
+                    break;
+                  case "CONSIGNMENT_RETURN":
+                    newPhysical = Math.max(0, newPhysical - origQty);
+                    newConsigned += origQty;
+                    await inventoryRepo.adjustOnHand(orgId, productId, locationId, -origQty, tx);
+                    break;
+                  case "CONSIGNMENT_SALE":
+                    newConsigned += origQty;
+                    await inventoryRepo.adjustOnHand(orgId, productId, locationId, origQty, tx);
+                    break;
+                  default:
+                    newPhysical += quantityChange;
+                    await inventoryRepo.adjustOnHand(orgId, productId, locationId, quantityChange, tx);
+                    break;
+                }
+              } else {
+                newPhysical += quantityChange;
+                await inventoryRepo.adjustOnHand(orgId, productId, locationId, quantityChange, tx);
               }
             } else {
               newPhysical += quantityChange;
-              await inventoryRepo.adjustOnHand(orgId, productId, locationId, quantityChange);
+              await inventoryRepo.adjustOnHand(orgId, productId, locationId, quantityChange, tx);
             }
-          } else {
-            newPhysical += quantityChange;
-            await inventoryRepo.adjustOnHand(orgId, productId, locationId, quantityChange);
-          }
-          break;
+            break;
 
-        default:
-          throw new Error(`Tipo de movimentação "${type}" desconhecido.`);
+          default:
+            throw new Error(`Tipo de movimentação "${type}" desconhecido.`);
+        }
+
+        // Update movement snapshot with final calculated values before flush
+        const updatedSummary = await inventoryRepo.getStockSummary(orgId, productId, tx);
+        movement.physicalBalanceAfter = Math.max(0, newPhysical);
+        movement.consignedBalanceAfter = Math.max(0, newConsigned);
+        movement.onHandAfter = updatedSummary.onHandTotal;
+        movement.reservedAfter = updatedSummary.reservedTotal;
+        movement.availableAfter = updatedSummary.availableTotal;
+
+        return movement;
+      } catch (projectionError: any) {
+        throw new Error(`[TRANSACIONAL ROLLBACK] Falha ao atualizar projeção de saldo: ${projectionError.message}`);
       }
-
-      // Update movement snapshot with final calculated values
-      const updatedSummary = await inventoryRepo.getStockSummary(orgId, productId);
-      movement.physicalBalanceAfter = Math.max(0, newPhysical);
-      movement.consignedBalanceAfter = Math.max(0, newConsigned);
-      movement.onHandAfter = updatedSummary.onHandTotal;
-      movement.reservedAfter = updatedSummary.reservedTotal;
-      movement.availableAfter = updatedSummary.availableTotal;
-
-      return movement;
-    } catch (projectionError: any) {
-      // 🛡️ ROLLBACK TRANSACTION: Remove movement so no uncommitted/orphan record remains
-      await inventoryRepo.removeMovement(movementId);
-      throw new Error(`[TRANSACIONAL ROLLBACK] Falha ao atualizar projeção de saldo: ${projectionError.message}`);
-    }
+    });
   }
 
   /**
@@ -365,7 +366,7 @@ export class InventoryService {
    * 1. Validate rules
    * 2. Insert ledger reservation movement
    * 3. Update inventory_balances reserved_quantity
-   * 4. Rollback movement if CHECK constraint fails
+   * 4. Atomic PostgreSQL ROLLBACK on any failure
    */
   static async reserveStock(orgId: string, dto: ReserveStockDTO): Promise<InventoryBalanceEntity> {
     const { productId, locationId, quantity, orderId, notes, operatorName } = dto;
@@ -373,36 +374,37 @@ export class InventoryService {
       throw new Error("A quantidade de reserva deve ser maior que zero.");
     }
 
-    const movementId = `mov-res-hold-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+      const movementId = `mov-res-hold-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-    // 1. Insert Ledger Trace First
-    await inventoryRepo.createMovement({
-      id: movementId,
-      organizationId: orgId,
-      productId,
-      locationId,
-      type: "RESERVATION_HOLD",
-      quantityChange: quantity,
-      physicalBalanceAfter: 0,
-      consignedBalanceAfter: 0,
-      onHandAfter: 0,
-      reservedAfter: 0,
-      availableAfter: 0,
-      referenceType: "CHECKOUT_RESERVATION",
-      referenceId: orderId,
-      operatorName: operatorName || "Motor de Reservas Concorrentes",
-      notes: notes || `Reserva concorrente de ${quantity} un realizada para pedido ${orderId || "N/A"}.`,
-      createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+      await inventoryRepo.createMovement(
+        {
+          id: movementId,
+          organizationId: orgId,
+          productId,
+          locationId,
+          type: "RESERVATION_HOLD",
+          quantityChange: quantity,
+          physicalBalanceAfter: 0,
+          consignedBalanceAfter: 0,
+          onHandAfter: 0,
+          reservedAfter: 0,
+          availableAfter: 0,
+          referenceType: "CHECKOUT_RESERVATION",
+          referenceId: orderId,
+          operatorName: operatorName || "Motor de Reservas Concorrentes",
+          notes: notes || `Reserva concorrente de ${quantity} un realizada para pedido ${orderId || "N/A"}.`,
+          createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+        },
+        tx
+      );
+
+      try {
+        return await inventoryRepo.reserveStock(orgId, productId, locationId, quantity, tx);
+      } catch (err: any) {
+        throw new Error(`[TRANSACIONAL ROLLBACK] Falha na reserva de estoque: ${err.message}`);
+      }
     });
-
-    // 2. Project into Balances with Rollback Protection
-    try {
-      const balance = await inventoryRepo.reserveStock(orgId, productId, locationId, quantity);
-      return balance;
-    } catch (err: any) {
-      await inventoryRepo.removeMovement(movementId);
-      throw new Error(`[TRANSACIONAL ROLLBACK] Falha na reserva de estoque: ${err.message}`);
-    }
   }
 
   /**
@@ -414,36 +416,37 @@ export class InventoryService {
       throw new Error("A quantidade a liberar deve ser maior que zero.");
     }
 
-    const movementId = `mov-res-rel-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+      const movementId = `mov-res-rel-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-    // 1. Insert Ledger Trace First
-    await inventoryRepo.createMovement({
-      id: movementId,
-      organizationId: orgId,
-      productId,
-      locationId,
-      type: "RESERVATION_RELEASE",
-      quantityChange: -quantity,
-      physicalBalanceAfter: 0,
-      consignedBalanceAfter: 0,
-      onHandAfter: 0,
-      reservedAfter: 0,
-      availableAfter: 0,
-      referenceType: "CHECKOUT_RESERVATION",
-      referenceId: orderId,
-      operatorName: operatorName || "Motor de Reservas Concorrentes",
-      notes: `Liberação de reserva de ${quantity} un. Motivo: ${reason || "Cancelamento/Expiração"}`,
-      createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+      await inventoryRepo.createMovement(
+        {
+          id: movementId,
+          organizationId: orgId,
+          productId,
+          locationId,
+          type: "RESERVATION_RELEASE",
+          quantityChange: -quantity,
+          physicalBalanceAfter: 0,
+          consignedBalanceAfter: 0,
+          onHandAfter: 0,
+          reservedAfter: 0,
+          availableAfter: 0,
+          referenceType: "CHECKOUT_RESERVATION",
+          referenceId: orderId,
+          operatorName: operatorName || "Motor de Reservas Concorrentes",
+          notes: `Liberação de reserva de ${quantity} un. Motivo: ${reason || "Cancelamento/Expiração"}`,
+          createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+        },
+        tx
+      );
+
+      try {
+        return await inventoryRepo.releaseReservation(orgId, productId, locationId, quantity, tx);
+      } catch (err: any) {
+        throw new Error(`[TRANSACIONAL ROLLBACK] Falha ao liberar reserva: ${err.message}`);
+      }
     });
-
-    // 2. Project into Balances with Rollback Protection
-    try {
-      const balance = await inventoryRepo.releaseReservation(orgId, productId, locationId, quantity);
-      return balance;
-    } catch (err: any) {
-      await inventoryRepo.removeMovement(movementId);
-      throw new Error(`[TRANSACIONAL ROLLBACK] Falha ao liberar reserva: ${err.message}`);
-    }
   }
 
   /**
@@ -455,36 +458,37 @@ export class InventoryService {
       throw new Error("A quantidade a confirmar deve ser maior que zero.");
     }
 
-    const movementId = `mov-sale-commit-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+      const movementId = `mov-sale-commit-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
-    // 1. Insert Ledger Sale Trace First
-    await inventoryRepo.createMovement({
-      id: movementId,
-      organizationId: orgId,
-      productId,
-      locationId,
-      type: "SALE",
-      quantityChange: -quantity,
-      physicalBalanceAfter: 0,
-      consignedBalanceAfter: 0,
-      onHandAfter: 0,
-      reservedAfter: 0,
-      availableAfter: 0,
-      referenceType: "ORDER",
-      referenceId: orderId,
-      operatorName: operatorName || "PDV / E-commerce Faturamento",
-      notes: notes || `Venda confirmada a partir de reserva de ${quantity} un (Pedido ${orderId || "N/A"}).`,
-      createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+      await inventoryRepo.createMovement(
+        {
+          id: movementId,
+          organizationId: orgId,
+          productId,
+          locationId,
+          type: "SALE",
+          quantityChange: -quantity,
+          physicalBalanceAfter: 0,
+          consignedBalanceAfter: 0,
+          onHandAfter: 0,
+          reservedAfter: 0,
+          availableAfter: 0,
+          referenceType: "ORDER",
+          referenceId: orderId,
+          operatorName: operatorName || "PDV / E-commerce Faturamento",
+          notes: notes || `Venda confirmada a partir de reserva de ${quantity} un (Pedido ${orderId || "N/A"}).`,
+          createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+        },
+        tx
+      );
+
+      try {
+        return await inventoryRepo.commitReservation(orgId, productId, locationId, quantity, tx);
+      } catch (err: any) {
+        throw new Error(`[TRANSACIONAL ROLLBACK] Falha ao confirmar baixa de reserva: ${err.message}`);
+      }
     });
-
-    // 2. Commit in Balances with Rollback Protection
-    try {
-      const balance = await inventoryRepo.commitReservation(orgId, productId, locationId, quantity);
-      return balance;
-    } catch (err: any) {
-      await inventoryRepo.removeMovement(movementId);
-      throw new Error(`[TRANSACIONAL ROLLBACK] Falha ao confirmar baixa de reserva: ${err.message}`);
-    }
   }
 
   /**

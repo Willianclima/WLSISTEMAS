@@ -310,7 +310,12 @@ router.post("/reset-users-for-init-test", async (_req, res) => {
       return res.status(403).json({ success: false, error: "Apenas disponível em ambiente de desenvolvimento." });
     }
     await TenantContext.run({ isSuperAdmin: true }, async () => {
-      await query("DELETE FROM organization_members");
+      const orgsRes = await query("SELECT id FROM organizations");
+      for (const orgRow of orgsRes.rows) {
+        await TenantContext.run({ tenantId: orgRow.id, isSuperAdmin: true }, async () => {
+          await query("DELETE FROM organization_members WHERE organization_id = $1", [orgRow.id]);
+        });
+      }
       await query("DELETE FROM users");
     });
     return res.json({

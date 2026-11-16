@@ -17,8 +17,9 @@ export class ConsignmentController {
 
   static async getById(req: AuthenticatedRequest, res: Response) {
     try {
-      const consignment = await consignmentRepo.findById(req.params.id);
-      if (!consignment) {
+      const orgId = req.organizationId!;
+      const consignment = await consignmentRepo.findById(req.params.id, orgId);
+      if (!consignment || consignment.organizationId !== orgId) {
         return res.status(404).json({ success: false, error: "Consignação não encontrada." });
       }
       return res.json({ success: true, consignment });

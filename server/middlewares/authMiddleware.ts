@@ -1,13 +1,10 @@
-import crypto from "crypto";
-import { Response, NextFunction } from "express";
+import { Response, NextFunction, Request } from "express";
 import pg from "pg";
-import { getSessionSecret } from "../config/authConfig";
 import { userRepo, orgRepo, memberRepo } from "../repositories";
 import { UserEntity, OrganizationEntity, OrganizationRole } from "../types/saas";
-import { Request } from "express";
 import { TenantContext } from "../db/tenantContext";
 import { auditService } from "../services/auditService";
-import { getPostgresPool, setLocalTenantId, applyRlsContext } from "../db/postgres";
+import { executeWithTenantRlsContext, query, sanitizeTenantId } from "../db/postgres";
 import { JwtService } from "../services/jwtService";
 import { isProduction } from "../config/environment";
 
@@ -117,8 +114,6 @@ export async function authMiddleware(req: AuthenticatedRequest, res: Response, n
       });
     }
 
-    req.user = user;
-
     // -------------------------------------------------------------------------
     // 2. IDENTIDADE VERIFICADA (Nível 1 de Barreira)
     // -------------------------------------------------------------------------
@@ -164,15 +159,28 @@ export async function authMiddleware(req: AuthenticatedRequest, res: Response, n
 
         // AUDITORIA P0 MANDATÓRIA: Todo acesso de Super Admin a dados de tenant é registrado
         const supportReason = (req.headers["x-support-reason"] as string) || "Sessão de suporte técnico supervisionado de plataforma";
-        await auditService.logAction(
-          targetTenantId,
-          user.id,
-          "SUPER_ADMIN_CONTROLLED_SUPPORT_ACCESS",
-          "ORGANIZATION",
-          targetTenantId,
-          req.ip,
-          req.headers["user-agent"] as string,
-          `Super Admin (${user.email}) acessou loja em suporte supervisionado. Motivo: ${supportReason}`
+        await TenantContext.run(
+          {
+            tenantId: targetTenantId,
+            userId: user.id,
+            userEmail: user.email,
+            userRole: "SUPER_ADMIN",
+            ipAddress: req.ip || (req.headers["x-forwarded-for"] as string) || "127.0.0.1",
+            userAgent: (req.headers["user-agent"] as string) || "Aura Web Client",
+            isSuperAdmin: true,
+          },
+          async () => {
+            await auditService.logAction(
+              targetTenantId!,
+              user!.id,
+              "SUPER_ADMIN_CONTROLLED_SUPPORT_ACCESS",
+              "ORGANIZATION",
+              targetTenantId!,
+              req.ip,
+              req.headers["user-agent"] as string,
+              `Super Admin (${user!.email}) acessou loja em suporte supervisionado. Motivo: ${supportReason}`
+            );
+          }
         );
       } else {
         // Super Admin operando em rota de plataforma global (sem escopo de loja específico)
@@ -217,7 +225,9 @@ export async function authMiddleware(req: AuthenticatedRequest, res: Response, n
       }
     }
 
-    if (!targetTenantId) {
+    const isSuperAdmin = Boolean(user.isPlatformSuperAdmin);
+
+    if (!targetTenantId && !isSuperAdmin) {
       return res.status(400).json({
         success: false,
         code: "TENANT_CONTEXT_MISSING",
@@ -225,39 +235,31 @@ export async function authMiddleware(req: AuthenticatedRequest, res: Response, n
       });
     }
 
-    const tenant = await orgRepo.findById(targetTenantId);
-    if (!tenant || tenant.status !== "ACTIVE") {
-      return res.status(404).json({
-        success: false,
-        code: "TENANT_INACTIVE_OR_NOT_FOUND",
-        error: `Organização '${targetTenantId}' não encontrada ou inativa no sistema.`,
-      });
+    let resolvedTenantId = "";
+    if (targetTenantId) {
+      const tenant = await orgRepo.findById(targetTenantId);
+      if (!tenant || tenant.status !== "ACTIVE") {
+        return res.status(404).json({
+          success: false,
+          code: "TENANT_INACTIVE_OR_NOT_FOUND",
+          error: `Organização '${targetTenantId}' não encontrada ou inativa no sistema.`,
+        });
+      }
+      req.tenant = tenant;
+      req.organizationId = tenant.id;
+      resolvedTenantId = tenant.id;
+    } else {
+      req.organizationId = "";
     }
 
-    req.tenant = tenant;
-    req.organizationId = tenant.id;
     req.userRole = effectiveRole;
+    const sanitizedTenantId = sanitizeTenantId(resolvedTenantId, { allowEmpty: isSuperAdmin });
 
-    const isSuperAdmin = Boolean(user.isPlatformSuperAdmin);
-    const sanitizedTenantId = tenant.id.replace(/[^a-zA-Z0-9_\-]/g, "");
-
-    // Injeção de helpers de banco garantindo SET LOCAL app.current_tenant_id antes de consultas
+    // Injeção de helpers transacionais seguros (conexão única + set_config(..., true))
     req.withTenantDb = async <T>(
       callback: (client: pg.PoolClient) => Promise<T>
     ): Promise<T> => {
-      const client = await getPostgresPool().connect();
-      try {
-        await client.query("BEGIN");
-        await setLocalTenantId(client, sanitizedTenantId, isSuperAdmin);
-        const result = await callback(client);
-        await client.query("COMMIT");
-        return result;
-      } catch (err) {
-        await client.query("ROLLBACK");
-        throw err;
-      } finally {
-        client.release();
-      }
+      return await executeWithTenantRlsContext(sanitizedTenantId, callback, isSuperAdmin);
     };
     req.executeWithRls = req.withTenantDb;
 
@@ -265,18 +267,12 @@ export async function authMiddleware(req: AuthenticatedRequest, res: Response, n
       text: string,
       params?: any[]
     ): Promise<pg.QueryResult<T>> => {
-      const client = await getPostgresPool().connect();
-      try {
-        await applyRlsContext(client);
-        return await client.query<T>(text, params);
-      } finally {
-        try {
-          await client.query(
-            "SELECT set_config('app.current_tenant_id', '', false), set_config('app.is_super_admin', 'false', false)"
-          );
-        } catch {}
-        client.release();
-      }
+      return await query<T>(text, params, {
+        context: {
+          tenantId: sanitizedTenantId,
+          isSuperAdmin,
+        },
+      });
     };
 
     req.db = {

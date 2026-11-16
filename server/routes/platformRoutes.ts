@@ -2,7 +2,7 @@ import { Router } from "express";
 import { authMiddleware, AuthenticatedRequest } from "../middlewares/authMiddleware";
 import { requireRole, requireSuperAdmin } from "../middlewares/rbacMiddleware";
 import { orgRepo, userRepo, subRepo, planRepo, moduleRepo, memberRepo } from "../repositories";
-import { query, getPostgresPool } from "../db/postgres";
+import { query, executeWithTenantRlsContext } from "../db/postgres";
 import { TenantContext } from "../db/tenantContext";
 import { auditService } from "../services/auditService";
 import { JwtService } from "../services/jwtService";
@@ -91,7 +91,7 @@ router.get("/dashboard", authMiddleware, requireRole(["SUPER_ADMIN"]), async (re
     const totalOrgs = allOrgs.length;
     const activeOrgs = allOrgs.filter((o) => o.status === "ACTIVE").length;
 
-    // 4. Consultas operacionais globais em tabelas de negócio (pedidos e produtos)
+    // 4. Consultas operacionais agregadas por tenant com contexto RLS explícito (compatível com 007_strict_rls_policies.sql)
     let totalProductsGlobal = 0;
     let totalOrdersGlobal = 0;
     let ordersToday = 0;
@@ -104,69 +104,97 @@ router.get("/dashboard", authMiddleware, requireRole(["SUPER_ADMIN"]), async (re
     let orgsWithPaidOrdersCount = 0;
 
     const orgStatsMap = new Map<string, { productsCount: number; ordersCount: number; gmv: number }>();
+    const orgModulesMap = new Map<string, Record<string, boolean>>();
 
-    try {
-      const prodRes = await query("SELECT count(*) as count FROM products");
-      totalProductsGlobal = parseInt(prodRes.rows[0]?.count || "0", 10);
+    for (const org of allOrgs) {
+      await TenantContext.run({ tenantId: org.id, isSuperAdmin: true }, async () => {
+        const stats = { productsCount: 0, ordersCount: 0, gmv: 0 };
 
-      const orgProds = await query("SELECT organization_id, count(*) as count FROM products GROUP BY organization_id");
-      orgsWithProductsCount = orgProds.rows.length;
-      for (const row of orgProds.rows) {
-        const orgId = row.organization_id;
-        const current = orgStatsMap.get(orgId) || { productsCount: 0, ordersCount: 0, gmv: 0 };
-        current.productsCount = parseInt(row.count || "0", 10);
-        orgStatsMap.set(orgId, current);
-      }
+        try {
+          const prodRes = await query(
+            `SELECT
+               count(*) as total_count,
+               count(*) FILTER (WHERE status IN ('ATIVO', 'ACTIVE', 'PUBLISHED')) as published_count
+             FROM products
+             WHERE organization_id = $1`,
+            [org.id]
+          );
+          const prodCount = parseInt(prodRes.rows[0]?.total_count || "0", 10);
+          const publishedCount = parseInt(prodRes.rows[0]?.published_count || "0", 10);
 
-      const publishedProds = await query(
-        "SELECT count(DISTINCT organization_id) as count FROM products WHERE status IN ('ATIVO', 'ACTIVE', 'PUBLISHED')"
-      );
-      orgsWithPublishedCatalogCount = parseInt(publishedProds.rows[0]?.count || "0", 10);
-    } catch {
-      totalProductsGlobal = 0;
-    }
+          if (prodCount > 0) {
+            totalProductsGlobal += prodCount;
+            orgsWithProductsCount += 1;
+            stats.productsCount = prodCount;
+          }
+          if (publishedCount > 0) {
+            orgsWithPublishedCatalogCount += 1;
+          }
+        } catch {
+          // Mantém zero em caso de falha isolada de leitura
+        }
 
-    try {
-      const ordersRes = await query(`
-        SELECT 
-          count(*) as total_orders,
-          coalesce(sum(total_amount), 0) as total_gmv,
-          count(*) FILTER (WHERE created_at >= CURRENT_DATE) as orders_today,
-          coalesce(sum(total_amount) FILTER (WHERE created_at >= CURRENT_DATE), 0) as gmv_today
-        FROM orders
-      `);
-      if (ordersRes.rows[0]) {
-        totalOrdersGlobal = parseInt(ordersRes.rows[0].total_orders || "0", 10);
-        gmvTotal = parseFloat(ordersRes.rows[0].total_gmv || "0");
-        ordersToday = parseInt(ordersRes.rows[0].orders_today || "0", 10);
-        gmvToday = parseFloat(ordersRes.rows[0].gmv_today || "0");
-      }
+        try {
+          const ordersRes = await query(
+            `SELECT
+               count(*) as total_orders,
+               coalesce(sum(total_amount), 0) as total_gmv,
+               count(*) FILTER (WHERE created_at >= CURRENT_DATE) as orders_today,
+               coalesce(sum(total_amount) FILTER (WHERE created_at >= CURRENT_DATE), 0) as gmv_today,
+               count(*) FILTER (WHERE status IN ('PAID', 'COMPLETED', 'SHIPPED', 'DELIVERED')) as paid_orders
+             FROM orders
+             WHERE organization_id = $1`,
+            [org.id]
+          );
+          if (ordersRes.rows[0]) {
+            const ordCount = parseInt(ordersRes.rows[0].total_orders || "0", 10);
+            const ordGmv = parseFloat(ordersRes.rows[0].total_gmv || "0");
+            const ordToday = parseInt(ordersRes.rows[0].orders_today || "0", 10);
+            const ordGmvToday = parseFloat(ordersRes.rows[0].gmv_today || "0");
+            const paidCount = parseInt(ordersRes.rows[0].paid_orders || "0", 10);
 
-      const orgOrders = await query(`
-        SELECT 
-          organization_id, 
-          count(*) as count, 
-          coalesce(sum(total_amount), 0) as gmv 
-        FROM orders 
-        GROUP BY organization_id
-      `);
-      orgsWithOrdersCount = orgOrders.rows.length;
-      for (const row of orgOrders.rows) {
-        const orgId = row.organization_id;
-        const current = orgStatsMap.get(orgId) || { productsCount: 0, ordersCount: 0, gmv: 0 };
-        current.ordersCount = parseInt(row.count || "0", 10);
-        current.gmv = parseFloat(row.gmv || "0");
-        orgStatsMap.set(orgId, current);
-      }
+            totalOrdersGlobal += ordCount;
+            gmvTotal += ordGmv;
+            ordersToday += ordToday;
+            gmvToday += ordGmvToday;
 
-      const paidOrdersRes = await query(`
-        SELECT count(DISTINCT organization_id) as count
-        FROM orders
-        WHERE status IN ('PAID', 'COMPLETED', 'SHIPPED', 'DELIVERED')
-      `);
-      orgsWithPaidOrdersCount = parseInt(paidOrdersRes.rows[0]?.count || "0", 10);
-    } catch {
-      // Fallback gracioso se orders estiver vazio
+            stats.ordersCount = ordCount;
+            stats.gmv = ordGmv;
+
+            if (ordCount > 0) orgsWithOrdersCount += 1;
+            if (paidCount > 0) orgsWithPaidOrdersCount += 1;
+          }
+        } catch {
+          // Fallback gracioso se orders estiver vazio
+        }
+
+        orgStatsMap.set(org.id, stats);
+
+        let activeModulesObj: Record<string, boolean> = {
+          consignments: true,
+          aiCopilot: true,
+          digitalWarranty: true,
+          laserCustom: true,
+          multiUser: true,
+          webhooksErp: true,
+        };
+
+        try {
+          const mods = await moduleRepo.listByOrgId(org.id);
+          if (mods.length > 0) {
+            activeModulesObj = {
+              consignments: mods.some((m) => m.moduleKey === "consignments" && m.isEnabled),
+              aiCopilot: mods.some((m) => m.moduleKey === "ai_copilot_mcp" && m.isEnabled),
+              digitalWarranty: mods.some((m) => m.moduleKey === "digital_warranty" && m.isEnabled),
+              laserCustom: mods.some((m) => m.moduleKey === "custom_jewelry" && m.isEnabled),
+              multiUser: mods.some((m) => m.moduleKey === "core_erp" && m.isEnabled),
+              webhooksErp: mods.some((m) => m.moduleKey === "webhooks_api" && m.isEnabled),
+            };
+          }
+        } catch {}
+
+        orgModulesMap.set(org.id, activeModulesObj);
+      });
     }
 
     // 5. Estruturação rica de cada organização para alimentar a tabela operacional da Central
@@ -184,8 +212,7 @@ router.get("/dashboard", authMiddleware, requireRole(["SUPER_ADMIN"]), async (re
         trialDaysLeft = Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
       }
 
-      // Buscar módulos ativos da organização
-      let activeModulesObj: Record<string, boolean> = {
+      const activeModulesObj = orgModulesMap.get(org.id) || {
         consignments: true,
         aiCopilot: true,
         digitalWarranty: true,
@@ -193,20 +220,6 @@ router.get("/dashboard", authMiddleware, requireRole(["SUPER_ADMIN"]), async (re
         multiUser: true,
         webhooksErp: true,
       };
-
-      try {
-        const mods = await moduleRepo.listByOrgId(org.id);
-        if (mods.length > 0) {
-          activeModulesObj = {
-            consignments: mods.some((m) => m.moduleKey === "consignments" && m.isEnabled),
-            aiCopilot: mods.some((m) => m.moduleKey === "ai_copilot_mcp" && m.isEnabled),
-            digitalWarranty: mods.some((m) => m.moduleKey === "digital_warranty" && m.isEnabled),
-            laserCustom: mods.some((m) => m.moduleKey === "custom_jewelry" && m.isEnabled),
-            multiUser: mods.some((m) => m.moduleKey === "core_erp" && m.isEnabled),
-            webhooksErp: mods.some((m) => m.moduleKey === "webhooks_api" && m.isEnabled),
-          };
-        }
-      } catch {}
 
       enrichedOrganizations.push({
         id: org.id,
@@ -250,11 +263,16 @@ router.get("/dashboard", authMiddleware, requireRole(["SUPER_ADMIN"]), async (re
     let pilotWarrantiesCount = 0;
     if (pilotOrg) {
       try {
-        const wRes = await query(
-          "SELECT count(*) as count FROM orders WHERE organization_id = $1 AND warranty_code IS NOT NULL",
-          [pilotOrg.id]
+        pilotWarrantiesCount = await TenantContext.run(
+          { tenantId: pilotOrg.id, isSuperAdmin: true },
+          async () => {
+            const wRes = await query(
+              "SELECT count(*) as count FROM orders WHERE organization_id = $1 AND warranty_code IS NOT NULL",
+              [pilotOrg.id]
+            );
+            return parseInt(wRes.rows[0]?.count || "0", 10);
+          }
         );
-        pilotWarrantiesCount = parseInt(wRes.rows[0]?.count || "0", 10);
       } catch {}
     }
 
@@ -381,22 +399,24 @@ router.post(
       const resolvedKey = keyMapping[moduleKey] || moduleKey;
 
       // AUDITORIA P0 MANDATÓRIA: Modificação de permissões/módulos por Super Admin deve persistir obrigatoriamente
-      await auditService.withAudit(
-        {
-          organizationId: orgId,
-          userId: req.user?.id,
-          action: "MODULE_TOGGLED",
-          entity: "ORGANIZATION_MODULE",
-          entityId: `${orgId}:${resolvedKey}`,
-          critical: true,
-          ipAddress: req.ip,
-          userAgent: req.headers["user-agent"] as string,
-          details: `Super Admin (${req.user?.email}) ${isEnabled ? "ativou" : "desativou"} o módulo '${resolvedKey}' para a organização ${orgId}`,
-        },
-        async () => {
-          await moduleRepo.setModuleStatus(orgId, resolvedKey as any, Boolean(isEnabled));
-        }
-      );
+      await TenantContext.run({ tenantId: orgId, isSuperAdmin: true }, async () => {
+        await auditService.withAudit(
+          {
+            organizationId: orgId,
+            userId: req.user?.id,
+            action: "MODULE_TOGGLED",
+            entity: "ORGANIZATION_MODULE",
+            entityId: `${orgId}:${resolvedKey}`,
+            critical: true,
+            ipAddress: req.ip,
+            userAgent: req.headers["user-agent"] as string,
+            details: `Super Admin (${req.user?.email}) ${isEnabled ? "ativou" : "desativou"} o módulo '${resolvedKey}' para a organização ${orgId}`,
+          },
+          async () => {
+            await moduleRepo.setModuleStatus(orgId, resolvedKey as any, Boolean(isEnabled));
+          }
+        );
+      });
 
       return res.json({
         success: true,
@@ -429,40 +449,54 @@ router.get(
         return res.status(404).json({ success: false, error: "Organização não encontrada." });
       }
 
-      const [subscription, allPlans, modules, members, recentAuditLogs] = await Promise.all([
-        subRepo.findByOrgId(orgId),
-        planRepo.listAll(),
-        moduleRepo.listByOrgId(orgId),
-        memberRepo.listByOrg(orgId),
-        auditService.listLogs(orgId, 25),
-      ]);
+      const { subscription, allPlans, modules, members, recentAuditLogs, productsCount, ordersCount, totalGmv, customersCount } =
+        await TenantContext.run({ tenantId: orgId, isSuperAdmin: true }, async () => {
+          const [sub, plans, mods, mems, logs] = await Promise.all([
+            subRepo.findByOrgId(orgId),
+            planRepo.listAll(),
+            moduleRepo.listByOrgId(orgId),
+            memberRepo.listByOrg(orgId),
+            auditService.listLogs(orgId, 25),
+          ]);
+
+          let pCount = 0;
+          let oCount = 0;
+          let oGmv = 0;
+          let cCount = 0;
+
+          try {
+            const prodRes = await query("SELECT count(*) as count FROM products WHERE organization_id = $1", [orgId]);
+            pCount = parseInt(prodRes.rows[0]?.count || "0", 10);
+          } catch {}
+
+          try {
+            const ordRes = await query(
+              "SELECT count(*) as count, coalesce(sum(total_amount), 0) as gmv FROM orders WHERE organization_id = $1",
+              [orgId]
+            );
+            oCount = parseInt(ordRes.rows[0]?.count || "0", 10);
+            oGmv = parseFloat(ordRes.rows[0]?.gmv || "0");
+          } catch {}
+
+          try {
+            const custRes = await query("SELECT count(*) as count FROM customers WHERE organization_id = $1", [orgId]);
+            cCount = parseInt(custRes.rows[0]?.count || "0", 10);
+          } catch {}
+
+          return {
+            subscription: sub,
+            allPlans: plans,
+            modules: mods,
+            members: mems,
+            recentAuditLogs: logs,
+            productsCount: pCount,
+            ordersCount: oCount,
+            totalGmv: oGmv,
+            customersCount: cCount,
+          };
+        });
 
       const plan = subscription ? allPlans.find((p) => p.id === subscription.planId) : null;
-
-      // Buscar contadores reais do banco
-      let productsCount = 0;
-      let ordersCount = 0;
-      let totalGmv = 0;
-      let customersCount = 0;
-
-      try {
-        const prodRes = await query("SELECT count(*) as count FROM products WHERE organization_id = $1", [orgId]);
-        productsCount = parseInt(prodRes.rows[0]?.count || "0", 10);
-      } catch {}
-
-      try {
-        const ordRes = await query(
-          "SELECT count(*) as count, coalesce(sum(total_amount), 0) as gmv FROM orders WHERE organization_id = $1",
-          [orgId]
-        );
-        ordersCount = parseInt(ordRes.rows[0]?.count || "0", 10);
-        totalGmv = parseFloat(ordRes.rows[0]?.gmv || "0");
-      } catch {}
-
-      try {
-        const custRes = await query("SELECT count(*) as count FROM customers WHERE organization_id = $1", [orgId]);
-        customersCount = parseInt(custRes.rows[0]?.count || "0", 10);
-      } catch {}
 
       // Mapear usuários com detalhes de nome/email
       const enrichedMembers = [];
@@ -527,57 +561,62 @@ router.put(
         return res.status(404).json({ success: false, error: "Organização não encontrada." });
       }
 
-      let sub = await subRepo.findByOrgId(orgId);
       const plan = targetPlanId ? await planRepo.findById(targetPlanId) : null;
 
       if (targetPlanId && !plan) {
         return res.status(400).json({ success: false, error: `Plano '${targetPlanId}' inválido.` });
       }
 
-      // Executa sob garantia de auditoria crítica P0 no PostgreSQL
-      await auditService.withAudit(
-        {
-          organizationId: orgId,
-          userId: req.user?.id,
-          action: "PLAN_CHANGED",
-          entity: "SUBSCRIPTION",
-          entityId: orgId,
-          critical: true,
-          ipAddress: req.ip,
-          userAgent: req.headers["user-agent"] as string,
-          details: `Super Admin (${req.user?.email}) alterou a assinatura de ${org.name}: Plano=${targetPlanId || sub?.planId}, Status=${status || sub?.status}.`,
-        },
-        async () => {
-          const now = new Date();
-          if (!sub) {
-            // Criar assinatura inicial se não existir
-            const trialEnd = new Date(now.getTime() + (extendTrialDays || 30) * 24 * 60 * 60 * 1000);
-            sub = await subRepo.create({
-              id: `sub-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-              organizationId: orgId,
-              planId: targetPlanId || "TRIAL_30D",
-              status: status || "TRIALING",
-              trialStartedAt: now.toISOString(),
-              trialEndsAt: trialEnd.toISOString(),
-              currentPeriodStart: now.toISOString(),
-              currentPeriodEnd: trialEnd.toISOString(),
-              paymentMethod: "MANUAL_TRIAL",
-              autoRenew: true,
-              createdAt: now.toISOString(),
-              updatedAt: now.toISOString(),
-            });
-          } else {
-            const updates: any = {};
-            if (targetPlanId) updates.planId = targetPlanId;
-            if (status) updates.status = status;
-            if (extendTrialDays && typeof extendTrialDays === "number") {
-              const currentEnd = new Date(sub.trialEndsAt).getTime();
-              updates.trialEndsAt = new Date(currentEnd + extendTrialDays * 24 * 60 * 60 * 1000).toISOString();
+      const sub = await TenantContext.run({ tenantId: orgId, isSuperAdmin: true }, async () => {
+        let currentSub = await subRepo.findByOrgId(orgId);
+
+        // Executa sob garantia de auditoria crítica P0 no PostgreSQL
+        await auditService.withAudit(
+          {
+            organizationId: orgId,
+            userId: req.user?.id,
+            action: "PLAN_CHANGED",
+            entity: "SUBSCRIPTION",
+            entityId: orgId,
+            critical: true,
+            ipAddress: req.ip,
+            userAgent: req.headers["user-agent"] as string,
+            details: `Super Admin (${req.user?.email}) alterou a assinatura de ${org.name}: Plano=${targetPlanId || currentSub?.planId}, Status=${status || currentSub?.status}.`,
+          },
+          async () => {
+            const now = new Date();
+            if (!currentSub) {
+              // Criar assinatura inicial se não existir
+              const trialEnd = new Date(now.getTime() + (extendTrialDays || 30) * 24 * 60 * 60 * 1000);
+              currentSub = await subRepo.create({
+                id: `sub-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+                organizationId: orgId,
+                planId: targetPlanId || "TRIAL_30D",
+                status: status || "TRIALING",
+                trialStartedAt: now.toISOString(),
+                trialEndsAt: trialEnd.toISOString(),
+                currentPeriodStart: now.toISOString(),
+                currentPeriodEnd: trialEnd.toISOString(),
+                paymentMethod: "MANUAL_TRIAL",
+                autoRenew: true,
+                createdAt: now.toISOString(),
+                updatedAt: now.toISOString(),
+              });
+            } else {
+              const updates: any = {};
+              if (targetPlanId) updates.planId = targetPlanId;
+              if (status) updates.status = status;
+              if (extendTrialDays && typeof extendTrialDays === "number") {
+                const currentEnd = new Date(currentSub.trialEndsAt).getTime();
+                updates.trialEndsAt = new Date(currentEnd + extendTrialDays * 24 * 60 * 60 * 1000).toISOString();
+              }
+              currentSub = await subRepo.update(currentSub.id, updates);
             }
-            sub = await subRepo.update(sub.id, updates);
           }
-        }
-      );
+        );
+
+        return currentSub;
+      });
 
       return res.json({
         success: true,
@@ -641,22 +680,24 @@ router.post(
 
       // AUDITORIA P0 MANDATÓRIA NO POSTGRESQL
       // Se falhar a gravação em audit_logs do Postgres, withAudit lança erro e a sessão é cancelada!
-      await auditService.withAudit(
-        {
-          organizationId: targetOrganizationId,
-          userId: req.user?.id,
-          action: "SUPER_ADMIN_CONTROLLED_SUPPORT_ACCESS",
-          entity: "ORGANIZATION",
-          entityId: targetOrganizationId,
-          critical: true,
-          ipAddress: req.ip,
-          userAgent: req.headers["user-agent"] as string,
-          details: `Super Admin (${req.user?.email}) iniciou sessão de suporte controlada no tenant ${targetOrg.name} (${targetOrganizationId}). Motivo: "${reason.trim()}". Escopo: ${validScope}. Duração: ${validMinutes}min.`,
-        },
-        async () => {
-          return true;
-        }
-      );
+      await TenantContext.run({ tenantId: targetOrganizationId, isSuperAdmin: true }, async () => {
+        await auditService.withAudit(
+          {
+            organizationId: targetOrganizationId,
+            userId: req.user?.id,
+            action: "SUPER_ADMIN_CONTROLLED_SUPPORT_ACCESS",
+            entity: "ORGANIZATION",
+            entityId: targetOrganizationId,
+            critical: true,
+            ipAddress: req.ip,
+            userAgent: req.headers["user-agent"] as string,
+            details: `Super Admin (${req.user?.email}) iniciou sessão de suporte controlada no tenant ${targetOrg.name} (${targetOrganizationId}). Motivo: "${reason.trim()}". Escopo: ${validScope}. Duração: ${validMinutes}min.`,
+          },
+          async () => {
+            return true;
+          }
+        );
+      });
 
       // Emissão de Token JWT de Suporte Escopado
       const supportToken = JwtService.sign(
@@ -738,119 +779,127 @@ router.post(
   authMiddleware,
   requireRole(["SUPER_ADMIN"]),
   async (req: AuthenticatedRequest, res) => {
-    const pool = getPostgresPool();
-    const client = await pool.connect();
-
     try {
       const timestamp = new Date().toISOString();
       const testOrgA = "org-lumina-01";
       const testOrgB = "org-elegance-02";
 
-      // 1. Garantir que o Tenant A possui ao menos 1 produto e 1 cliente
-      const prodARes = await query(
-        "SELECT id, name FROM products WHERE organization_id = $1 LIMIT 1",
-        [testOrgA]
+      // 1. Garantir que o Tenant A possui ao menos 1 produto sob contexto RLS explícito do Tenant A
+      const targetProdId = await executeWithTenantRlsContext(
+        testOrgA,
+        async (client) => {
+          const prodARes = await client.query(
+            "SELECT id, name FROM products WHERE organization_id = $1 LIMIT 1",
+            [testOrgA]
+          );
+          let prodId = prodARes.rows[0]?.id;
+
+          if (!prodId) {
+            prodId = `prod-test-iso-${Date.now()}`;
+            await client.query(
+              `INSERT INTO products (id, organization_id, sku, name, category, bath, price, cost_price, warranty_months, status)
+               VALUES ($1, $2, 'SKU-ISO-01', 'Anel Teste Isolamento RLS', 'ANEIS', 'OURO_18K', 299.00, 89.00, 12, 'ATIVO')`,
+              [prodId, testOrgA]
+            );
+          }
+
+          return prodId;
+        },
+        true
       );
-      let targetProdId = prodARes.rows[0]?.id;
 
-      if (!targetProdId) {
-        targetProdId = `prod-test-iso-${Date.now()}`;
-        await query(
-          `INSERT INTO products (id, organization_id, sku, name, category, bath, price, cost_price, warranty_months, status)
-           VALUES ($1, $2, 'SKU-ISO-01', 'Anel Teste Isolamento RLS', 'ANEIS', 'OURO_18K', 299.00, 89.00, 12, 'ATIVO')`,
-          [targetProdId, testOrgA]
-        );
-      }
+      // 2. Executar os 5 testes sob transação única configurada estritamente para Tenant B (is_super_admin = false) via set_config(..., true)
+      const results = await executeWithTenantRlsContext(
+        testOrgB,
+        async (client) => {
+          const checkResults = [];
+          await client.query("SAVEPOINT iso_check");
+          try {
+            // Teste 1: Tenant B tenta LER produto de Tenant A
+            const readProdResult = await client.query(
+              "SELECT * FROM products WHERE id = $1",
+              [targetProdId]
+            );
+            checkResults.push({
+              test: "RLS READ: Tenant B consultando produto de Tenant A",
+              expected: "0 registros retornados (invisibilidade total)",
+              actual: `${readProdResult.rows.length} registros retornados`,
+              passed: readProdResult.rows.length === 0,
+            });
 
-      const results = [];
+            // Teste 2: Tenant B tenta ATUALIZAR produto de Tenant A
+            const updateProdResult = await client.query(
+              "UPDATE products SET price = 9999.00 WHERE id = $1",
+              [targetProdId]
+            );
+            checkResults.push({
+              test: "RLS UPDATE: Tenant B tentando adulterar produto de Tenant A",
+              expected: "0 registros afetados",
+              actual: `${updateProdResult.rowCount} registros afetados`,
+              passed: updateProdResult.rowCount === 0,
+            });
 
-      // Teste 1: Tenant B tenta LER produto de Tenant A via SET LOCAL app.current_tenant_id = testOrgB
-      await client.query("BEGIN");
-      await client.query(`SET LOCAL app.current_tenant_id = '${testOrgB}'`);
-      await client.query("SET LOCAL app.is_super_admin = 'false'");
+            // Teste 3: Tenant B tenta EXCLUIR produto de Tenant A
+            const deleteProdResult = await client.query(
+              "DELETE FROM products WHERE id = $1",
+              [targetProdId]
+            );
+            checkResults.push({
+              test: "RLS DELETE: Tenant B tentando deletar produto de Tenant A",
+              expected: "0 registros afetados",
+              actual: `${deleteProdResult.rowCount} registros afetados`,
+              passed: deleteProdResult.rowCount === 0,
+            });
 
-      const readProdResult = await client.query(
-        "SELECT * FROM products WHERE id = $1",
-        [targetProdId]
+            // Teste 4: Tenant B tenta LER pedidos de Tenant A
+            const readOrdersResult = await client.query(
+              "SELECT * FROM orders WHERE organization_id = $1",
+              [testOrgA]
+            );
+            checkResults.push({
+              test: "RLS ORDERS: Tenant B tentando ler pedidos de Tenant A",
+              expected: "0 registros retornados",
+              actual: `${readOrdersResult.rows.length} registros retornados`,
+              passed: readOrdersResult.rows.length === 0,
+            });
+
+            // Teste 5: Tenant B tenta LER clientes de Tenant A
+            const readCustResult = await client.query(
+              "SELECT * FROM customers WHERE organization_id = $1",
+              [testOrgA]
+            );
+            checkResults.push({
+              test: "RLS CUSTOMERS: Tenant B tentando ler carteira de clientes de Tenant A",
+              expected: "0 registros retornados",
+              actual: `${readCustResult.rows.length} registros retornados`,
+              passed: readCustResult.rows.length === 0,
+            });
+          } finally {
+            await client.query("ROLLBACK TO SAVEPOINT iso_check");
+          }
+          return checkResults;
+        },
+        false
       );
-      const passedRead = readProdResult.rows.length === 0;
-      results.push({
-        test: "RLS READ: Tenant B consultando produto de Tenant A",
-        expected: "0 registros retornados (invisibilidade total)",
-        actual: `${readProdResult.rows.length} registros retornados`,
-        passed: passedRead,
-      });
-
-      // Teste 2: Tenant B tenta ATUALIZAR produto de Tenant A
-      const updateProdResult = await client.query(
-        "UPDATE products SET price = 9999.00 WHERE id = $1",
-        [targetProdId]
-      );
-      const passedUpdate = updateProdResult.rowCount === 0;
-      results.push({
-        test: "RLS UPDATE: Tenant B tentando adulterar produto de Tenant A",
-        expected: "0 registros afetados",
-        actual: `${updateProdResult.rowCount} registros afetados`,
-        passed: passedUpdate,
-      });
-
-      // Teste 3: Tenant B tenta EXCLUIR produto de Tenant A
-      const deleteProdResult = await client.query(
-        "DELETE FROM products WHERE id = $1",
-        [targetProdId]
-      );
-      const passedDelete = deleteProdResult.rowCount === 0;
-      results.push({
-        test: "RLS DELETE: Tenant B tentando deletar produto de Tenant A",
-        expected: "0 registros afetados",
-        actual: `${deleteProdResult.rowCount} registros afetados`,
-        passed: passedDelete,
-      });
-
-      // Teste 4: Tenant B tenta LER pedidos de Tenant A
-      const readOrdersResult = await client.query(
-        "SELECT * FROM orders WHERE organization_id = $1",
-        [testOrgA]
-      );
-      const passedOrders = readOrdersResult.rows.length === 0;
-      results.push({
-        test: "RLS ORDERS: Tenant B tentando ler pedidos de Tenant A",
-        expected: "0 registros retornados",
-        actual: `${readOrdersResult.rows.length} registros retornados`,
-        passed: passedOrders,
-      });
-
-      // Teste 5: Tenant B tenta LER clientes de Tenant A
-      const readCustResult = await client.query(
-        "SELECT * FROM customers WHERE organization_id = $1",
-        [testOrgA]
-      );
-      const passedCustomers = readCustResult.rows.length === 0;
-      results.push({
-        test: "RLS CUSTOMERS: Tenant B tentando ler carteira de clientes de Tenant A",
-        expected: "0 registros retornados",
-        actual: `${readCustResult.rows.length} registros retornados`,
-        passed: passedCustomers,
-      });
-
-      await client.query("ROLLBACK");
 
       // Teste 6: Auditoria P0 Mandatória do Teste no PostgreSQL
       const allPassed = results.every((r) => r.passed);
 
       if (allPassed) {
-        await auditService.logAction(
-          testOrgA,
-          req.user?.id,
-          "ISOLATION_VERIFICATION_TEST_PASSED",
-          "SECURITY_RLS",
-          "GLOBAL_VERIFICATION",
-          req.ip,
-          req.headers["user-agent"] as string,
-          `Bateria de testes de isolamento multi-tenant executada com 100% de aprovação. RLS ativo e inviolável.`,
-          { results },
-          { requirePersistence: true }
-        );
+        await TenantContext.run({ tenantId: testOrgA, isSuperAdmin: true }, async () => {
+          await auditService.logAction(
+            testOrgA,
+            req.user?.id,
+            "ISOLATION_VERIFICATION_TEST_PASSED",
+            "SECURITY_RLS",
+            "GLOBAL_VERIFICATION",
+            req.ip,
+            req.headers["user-agent"] as string,
+            `Bateria de testes de isolamento multi-tenant executada com 100% de aprovação. RLS ativo e inviolável.`,
+            { results },
+            { requirePersistence: true }
+          );
+        });
       }
 
       return res.json({
@@ -865,8 +914,6 @@ router.post(
     } catch (err: any) {
       console.error("[VerifyIsolation] Erro ao executar teste:", err);
       return res.status(500).json({ success: false, error: err.message });
-    } finally {
-      client.release();
     }
   }
 );
@@ -898,7 +945,7 @@ router.post(
       const targetSku = "SKU-STRESS-SINGLE-UNIT";
 
       // 1. Preparar fixture no PostgreSQL: Produto com exatamente 1 unidade disponível
-      const defaultLocId = await TenantContext.run({ isSuperAdmin: true }, async () => {
+      const defaultLocId = await TenantContext.run({ tenantId, isSuperAdmin: true }, async () => {
         // Obter ou criar localização padrão
         const locRes = await query(
           "SELECT id FROM inventory_locations WHERE organization_id = $1 LIMIT 1",
@@ -1041,7 +1088,7 @@ router.post(
       const singleWinner = (isA_Success && isB_Conflict) || (isB_Success && isA_Conflict);
 
       // 4. Verificação no PostgreSQL do saldo final pós-concorrência
-      const balanceCheck = await TenantContext.run({ isSuperAdmin: true }, async () => {
+      const balanceCheck = await TenantContext.run({ tenantId, isSuperAdmin: true }, async () => {
         const balRes = await query(
           `SELECT on_hand_quantity, reserved_quantity, available_quantity 
            FROM inventory_balances 
@@ -1076,23 +1123,25 @@ router.post(
 
       // 5. Auditoria P0 no PostgreSQL confirmando a prova de concorrência
       if (testPassed) {
-        await auditService.logAction(
-          tenantId,
-          req.user?.id,
-          "CONCURRENCY_ISOLATION_TEST_PASSED",
-          "INVENTORY_BALANCE",
-          targetProdId,
-          req.ip,
-          req.headers["user-agent"] as string,
-          `Teste de concorrência e isolamento executado com sucesso: 2 consumidores disputaram 1 unidade simultaneamente via /api/orders/public. Vencedor: ${winnerName} (Pedido: ${winnerOrder?.orderNumber}). Rejeitado: ${rejectedName} (409 INSUFFICIENT_STOCK). Zero overselling validado no PostgreSQL (On-hand: 1, Reservado: 1, Disponível: 0).`,
-          {
-            consumerA: { status: resA.status, body: dataA },
-            consumerB: { status: resB.status, body: dataB },
-            dbBalance: { onHand, reserved, available, activeRes },
-            durationMs,
-          },
-          { requirePersistence: true }
-        );
+        await TenantContext.run({ tenantId, isSuperAdmin: true }, async () => {
+          await auditService.logAction(
+            tenantId,
+            req.user?.id,
+            "CONCURRENCY_ISOLATION_TEST_PASSED",
+            "INVENTORY_BALANCE",
+            targetProdId,
+            req.ip,
+            req.headers["user-agent"] as string,
+            `Teste de concorrência e isolamento executado com sucesso: 2 consumidores disputaram 1 unidade simultaneamente via /api/orders/public. Vencedor: ${winnerName} (Pedido: ${winnerOrder?.orderNumber}). Rejeitado: ${rejectedName} (409 INSUFFICIENT_STOCK). Zero overselling validado no PostgreSQL (On-hand: 1, Reservado: 1, Disponível: 0).`,
+            {
+              consumerA: { status: resA.status, body: dataA },
+              consumerB: { status: resB.status, body: dataB },
+              dbBalance: { onHand, reserved, available, activeRes },
+              durationMs,
+            },
+            { requirePersistence: true }
+          );
+        });
       }
 
       return res.json({
@@ -1222,66 +1271,67 @@ router.post(
       const tenantId = org.id;
       const storeSlug = org.slug || "lumina";
 
-      // 2. Garantir Localização Matriz
-      const locRes = await query(
-        `SELECT id FROM inventory_locations WHERE organization_id = $1 LIMIT 1`,
-        [tenantId]
-      );
-      let locationId = locRes.rows[0]?.id;
-      if (!locationId) {
-        locationId = `loc-${tenantId.replace("org-", "")}-matriz`;
-        await query(
-          `INSERT INTO inventory_locations (id, organization_id, name, type, is_active)
-           VALUES ($1, $2, 'Showroom Matriz Lumina', 'PHYSICAL_STORE', true)
-           ON CONFLICT (id) DO NOTHING`,
-          [locationId, tenantId]
-        );
-      }
-
-      // 3. Cadastrar/Garantir Produto de Teste no PostgreSQL
+      // 2-5. Setup de localização, produto e saldo sob contexto RLS explícito do tenantId
       const targetProdId = "prod-fluxo-comercial-01";
       const targetSku = "SKU-FLUXO-COMERCIAL-01";
       const unitPrice = 380.0;
       const prodName = "Colar Ponto de Luz Ouro 18k";
-
-      await query(
-        `INSERT INTO products (
-          id, organization_id, sku, name, category, collection, material,
-          bath, stones, price, cost_price, warranty_months,
-          is_customizable, status, description
-        ) VALUES (
-          $1, $2, $3, $4, 'COLARES', 'FLUXO_COMERCIAL', 'Semijoia em Ouro 18k',
-          'OURO_18K', '[]'::jsonb, $5, 120.00, 12,
-          false, 'ATIVO', 'Colar Ponto de Luz em Banho Ouro 18K com Zircônia lapidação brilhante.'
-        )
-        ON CONFLICT (organization_id, sku) DO UPDATE SET
-          price = $5,
-          status = 'ATIVO'`,
-        [targetProdId, tenantId, targetSku, prodName, unitPrice]
-      );
-
-      // Limpar reservas ativas anteriores para manter idempotência
-      await query(
-        `UPDATE inventory_reservations 
-         SET status = 'CANCELED', released_at = NOW() 
-         WHERE organization_id = $1 AND product_id = $2 AND status = 'ACTIVE'`,
-        [tenantId, targetProdId]
-      );
-
-      // 4. Resetar Saldo Inicial de Estoque no PostgreSQL: Físico = 5, Reservado = 0
       const initialPhysical = 5;
-      await query(
-        `INSERT INTO inventory_balances (
-          id, organization_id, product_id, location_id, on_hand_quantity, reserved_quantity
-        ) VALUES (
-          $1, $2, $3, $4, $5, 0
-        )
-        ON CONFLICT (organization_id, product_id, location_id) DO UPDATE SET
-          on_hand_quantity = $5,
-          reserved_quantity = 0,
-          updated_at = NOW()`,
-        [`bal-${tenantId}-${targetProdId}`, tenantId, targetProdId, locationId, initialPhysical]
-      );
+
+      const locationId = await TenantContext.run({ tenantId, isSuperAdmin: true }, async () => {
+        const locRes = await query(
+          `SELECT id FROM inventory_locations WHERE organization_id = $1 LIMIT 1`,
+          [tenantId]
+        );
+        let locId = locRes.rows[0]?.id;
+        if (!locId) {
+          locId = `loc-${tenantId.replace("org-", "")}-matriz`;
+          await query(
+            `INSERT INTO inventory_locations (id, organization_id, name, type, is_active)
+             VALUES ($1, $2, 'Showroom Matriz Lumina', 'PHYSICAL_STORE', true)
+             ON CONFLICT (id) DO NOTHING`,
+            [locId, tenantId]
+          );
+        }
+
+        await query(
+          `INSERT INTO products (
+            id, organization_id, sku, name, category, collection, material,
+            bath, stones, price, cost_price, warranty_months,
+            is_customizable, status, description
+          ) VALUES (
+            $1, $2, $3, $4, 'COLARES', 'FLUXO_COMERCIAL', 'Semijoia em Ouro 18k',
+            'OURO_18K', '[]'::jsonb, $5, 120.00, 12,
+            false, 'ATIVO', 'Colar Ponto de Luz em Banho Ouro 18K com Zircônia lapidação brilhante.'
+          )
+          ON CONFLICT (organization_id, sku) DO UPDATE SET
+            price = $5,
+            status = 'ATIVO'`,
+          [targetProdId, tenantId, targetSku, prodName, unitPrice]
+        );
+
+        await query(
+          `UPDATE inventory_reservations 
+           SET status = 'CANCELED', released_at = NOW() 
+           WHERE organization_id = $1 AND product_id = $2 AND status = 'ACTIVE'`,
+          [tenantId, targetProdId]
+        );
+
+        await query(
+          `INSERT INTO inventory_balances (
+            id, organization_id, product_id, location_id, on_hand_quantity, reserved_quantity
+          ) VALUES (
+            $1, $2, $3, $4, $5, 0
+          )
+          ON CONFLICT (organization_id, product_id, location_id) DO UPDATE SET
+            on_hand_quantity = $5,
+            reserved_quantity = 0,
+            updated_at = NOW()`,
+          [`bal-${tenantId}-${targetProdId}`, tenantId, targetProdId, locId, initialPhysical]
+        );
+
+        return locId;
+      });
 
       // 5. Catálogo Público: Resolução segura via Slug
       const catalogOrg = await orgRepo.findBySlug(storeSlug);
@@ -1343,21 +1393,20 @@ router.post(
       );
 
       // 7. Auditoria de Reserva no PostgreSQL
-      const balanceAfterReservation = await query(
-        `SELECT on_hand_quantity, reserved_quantity, (on_hand_quantity - reserved_quantity) as available_quantity
-         FROM inventory_balances
-         WHERE organization_id = $1 AND product_id = $2 AND location_id = $3`,
-        [tenantId, targetProdId, locationId]
+      const balanceAfterReservation = await TenantContext.run(
+        { tenantId, isSuperAdmin: true },
+        async () => {
+          return await query(
+            `SELECT on_hand_quantity, reserved_quantity, (on_hand_quantity - reserved_quantity) as available_quantity
+             FROM inventory_balances
+             WHERE organization_id = $1 AND product_id = $2 AND location_id = $3`,
+            [tenantId, targetProdId, locationId]
+          );
+        }
       );
       const resOnHand = Number(balanceAfterReservation.rows[0]?.on_hand_quantity ?? 0);
       const resReserved = Number(balanceAfterReservation.rows[0]?.reserved_quantity ?? 0);
       const resAvailable = Number(balanceAfterReservation.rows[0]?.available_quantity ?? 0);
-
-      const reservationRow = await query(
-        `SELECT id, quantity, status FROM inventory_reservations
-         WHERE organization_id = $1 AND product_id = $2 AND (reference_id = $3 OR reference_id = $4) LIMIT 1`,
-        [tenantId, targetProdId, createdOrder.id, createdOrder.orderNumber]
-      );
       const hasActiveReservation = resReserved === purchaseQty;
 
       // 8. Confirmação de Pagamento (FSM Transition: CONFIRM_PAYMENT)
@@ -1378,24 +1427,28 @@ router.post(
       );
 
       // 9. Venda / Ledger no PostgreSQL após confirmação
-      const balanceAfterSale = await query(
-        `SELECT on_hand_quantity, reserved_quantity, (on_hand_quantity - reserved_quantity) as available_quantity
-         FROM inventory_balances
-         WHERE organization_id = $1 AND product_id = $2 AND location_id = $3`,
-        [tenantId, targetProdId, locationId]
+      const { balanceAfterSale, ledgerMovement } = await TenantContext.run(
+        { tenantId, isSuperAdmin: true },
+        async () => {
+          const bal = await query(
+            `SELECT on_hand_quantity, reserved_quantity, (on_hand_quantity - reserved_quantity) as available_quantity
+             FROM inventory_balances
+             WHERE organization_id = $1 AND product_id = $2 AND location_id = $3`,
+            [tenantId, targetProdId, locationId]
+          );
+          const mov = await query(
+            `SELECT id, type, quantity_change, reference_type, reference_id, operator_name, created_at
+             FROM inventory_movements
+             WHERE organization_id = $1 AND product_id = $2 AND type = 'SALE'
+             ORDER BY created_at DESC LIMIT 1`,
+            [tenantId, targetProdId]
+          );
+          return { balanceAfterSale: bal, ledgerMovement: mov };
+        }
       );
       const saleOnHand = Number(balanceAfterSale.rows[0]?.on_hand_quantity ?? 0);
       const saleReserved = Number(balanceAfterSale.rows[0]?.reserved_quantity ?? 0);
       const saleAvailable = Number(balanceAfterSale.rows[0]?.available_quantity ?? 0);
-
-      // Consultar lançamento contábil no Ledger (inventory_movements)
-      const ledgerMovement = await query(
-        `SELECT id, type, quantity_change, reference_type, reference_id, operator_name, created_at
-         FROM inventory_movements
-         WHERE organization_id = $1 AND product_id = $2 AND type = 'SALE'
-         ORDER BY created_at DESC LIMIT 1`,
-        [tenantId, targetProdId]
-      );
       const hasLedgerSale = ledgerMovement.rows.length > 0 && Number(ledgerMovement.rows[0].quantity_change) === -purchaseQty;
 
       // 10. Garantia Digital Emitida
@@ -1419,29 +1472,42 @@ router.post(
       const whatsappUrl = `https://wa.me/55${cleanCustomerPhone}?text=${encodeURIComponent(whatsappText)}`;
 
       // 12. Simultaneamente: Central de Comando Super Admin enxerga Loja A
-      const [sub, allMods, storeOrdersCount, storeTotalGmv, auditTrail] = await Promise.all([
-        subRepo.findByOrgId(tenantId),
-        moduleRepo.listByOrgId(tenantId),
-        query(`SELECT COUNT(*) as count FROM orders WHERE organization_id = $1`, [tenantId]),
-        query(`SELECT COALESCE(SUM(total_amount), 0) as gmv FROM orders WHERE organization_id = $1 AND status = 'PAID'`, [tenantId]),
-        auditService.listLogs(tenantId, 10),
-      ]);
+      const { sub, allMods, storeOrdersCount, storeTotalGmv, auditTrail } = await TenantContext.run(
+        { tenantId, isSuperAdmin: true },
+        async () => {
+          const [s, mods, ordCnt, ordGmv, logs] = await Promise.all([
+            subRepo.findByOrgId(tenantId),
+            moduleRepo.listByOrgId(tenantId),
+            query(`SELECT COUNT(*) as count FROM orders WHERE organization_id = $1`, [tenantId]),
+            query(`SELECT COALESCE(SUM(total_amount), 0) as gmv FROM orders WHERE organization_id = $1 AND status = 'PAID'`, [tenantId]),
+            auditService.listLogs(tenantId, 10),
+          ]);
+
+          // Registrar auditoria da validação de ponta a ponta
+          await auditService.logAction(
+            tenantId,
+            req.user!.id,
+            "COMMERCIAL_FLOW_INTEGRATION_VERIFIED",
+            "ORDER",
+            paidOrder.id,
+            req.ip,
+            req.headers["user-agent"] as string,
+            `Validação comercial ponta a ponta concluída: Pedido #${paidOrder.orderNumber}, Garantia: ${paidOrder.warrantyCode}, Baixa Estoque: -${purchaseQty} un, WhatsApp gerado.`
+          );
+
+          return {
+            sub: s,
+            allMods: mods,
+            storeOrdersCount: ordCnt,
+            storeTotalGmv: ordGmv,
+            auditTrail: logs,
+          };
+        }
+      );
 
       const plan = sub ? await planRepo.findById(sub.planId) : null;
       const totalOrdersInStore = Number(storeOrdersCount.rows[0]?.count ?? 0);
       const totalGmvInStore = Number(storeTotalGmv.rows[0]?.gmv ?? 0);
-
-      // Registrar auditoria da validação de ponta a ponta
-      await auditService.logAction(
-        tenantId,
-        req.user!.id,
-        "COMMERCIAL_FLOW_INTEGRATION_VERIFIED",
-        "ORDER",
-        paidOrder.id,
-        req.ip,
-        req.headers["user-agent"] as string,
-        `Validação comercial ponta a ponta concluída: Pedido #${paidOrder.orderNumber}, Garantia: ${paidOrder.warrantyCode}, Baixa Estoque: -${purchaseQty} un, WhatsApp gerado.`
-      );
 
       const durationMs = Date.now() - startTime;
 
@@ -1594,89 +1660,32 @@ router.post(
       const pilotOwnerEmail = "camila.piloto@bellasemijoias.com.br";
       const pilotOwnerName = "Camila Rocha";
 
-      await query(
-        `INSERT INTO organizations (
-          id, name, slug, document, segment, city, state, contact_email, contact_whatsapp, status
-        ) VALUES (
-          $1, $2, $3, '38.123.456/0001-99', 'SEMIJOIAS', 'Campinas', 'SP', $4, '(19) 99876-5432', 'ACTIVE'
-        )
-        ON CONFLICT (id) DO UPDATE SET
-          name = $2,
-          slug = $3,
-          status = 'ACTIVE'`,
-        [pilotOrgId, pilotOrgName, pilotSlug, pilotOwnerEmail]
-      );
+      await TenantContext.run({ isSuperAdmin: true }, async () => {
+        await query(
+          `INSERT INTO organizations (
+            id, name, slug, document, segment, city, state, contact_email, contact_whatsapp, status
+          ) VALUES (
+            $1, $2, $3, '38.123.456/0001-99', 'SEMIJOIAS', 'Campinas', 'SP', $4, '(19) 99876-5432', 'ACTIVE'
+          )
+          ON CONFLICT (id) DO UPDATE SET
+            name = $2,
+            slug = $3,
+            status = 'ACTIVE'`,
+          [pilotOrgId, pilotOrgName, pilotSlug, pilotOwnerEmail]
+        );
 
-      // Usuário Proprietária da Loja
-      const pilotUserId = "user-piloto-01";
-      await query(
-        `INSERT INTO users (id, name, email, password_hash, status)
-         VALUES ($1, $2, $3, 'argon2-stub-hash', 'ACTIVE')
-         ON CONFLICT (id) DO UPDATE SET name = $2, email = $3, status = 'ACTIVE'`,
-        [pilotUserId, pilotOwnerName, pilotOwnerEmail]
-      );
-
-      // Membership
-      await query(
-        `INSERT INTO organization_members (id, organization_id, user_id, role, status)
-         VALUES ($1, $2, $3, 'OWNER', 'ACTIVE')
-         ON CONFLICT (organization_id, user_id) DO UPDATE SET role = 'OWNER', status = 'ACTIVE'`,
-        [`mem-${pilotOrgId}-${pilotUserId}`, pilotOrgId, pilotUserId]
-      );
-
-      stepsLog.push({
-        step: 1,
-        name: "CRIAR CLIENTE",
-        detail: `Organização '${pilotOrgName}' (${pilotOrgId}) e proprietária '${pilotOwnerName}' criados com sucesso.`,
-        passed: true,
+        // Usuário Proprietária da Loja
+        const pilotUserId = "user-piloto-01";
+        await query(
+          `INSERT INTO users (id, name, email, password_hash, status)
+           VALUES ($1, $2, $3, 'argon2-stub-hash', 'ACTIVE')
+           ON CONFLICT (id) DO UPDATE SET name = $2, email = $3, status = 'ACTIVE'`,
+          [pilotUserId, pilotOwnerName, pilotOwnerEmail]
+        );
       });
 
-      // -----------------------------------------------------------------
-      // ETAPA 2: TRIAL 30 DIAS
-      // -----------------------------------------------------------------
       const trialEndsAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
-      await query(
-        `INSERT INTO subscriptions (
-          id, organization_id, plan_id, status, current_period_start, current_period_end, trial_started_at, trial_ends_at
-        ) VALUES (
-          $1, $2, 'PRO', 'TRIALING', NOW(), $3, NOW(), $3
-        )
-        ON CONFLICT (organization_id) DO UPDATE SET
-          plan_id = 'PRO',
-          status = 'TRIALING',
-          trial_ends_at = $3`,
-        [`sub-${pilotOrgId}`, pilotOrgId, trialEndsAt]
-      );
-
-      stepsLog.push({
-        step: 2,
-        name: "TRIAL 30 DIAS",
-        detail: `Plano PRO vinculado em regime TRIALING. Período de avaliação válido até ${trialEndsAt.toLocaleDateString("pt-BR")}.`,
-        passed: true,
-      });
-
-      // -----------------------------------------------------------------
-      // ETAPA 3: ONBOARDING
-      // -----------------------------------------------------------------
-      // Configura localização Matriz e preferências operacionais
       const locId = `loc-${pilotOrgId}-matriz`;
-      await query(
-        `INSERT INTO inventory_locations (id, organization_id, name, code, type, is_active)
-         VALUES ($1, $2, 'Showroom Matriz Bella Joias', 'MATRIZ', 'PHYSICAL_STORE', true)
-         ON CONFLICT (id) DO NOTHING`,
-        [locId, pilotOrgId]
-      );
-
-      stepsLog.push({
-        step: 3,
-        name: "ONBOARDING",
-        detail: `Showroom Matriz configurado, WhatsApp e identidade visual salvos no PostgreSQL.`,
-        passed: true,
-      });
-
-      // -----------------------------------------------------------------
-      // ETAPA 4: 10 PRODUTOS
-      // -----------------------------------------------------------------
       const catalogBatch = [
         { sku: "BEL-COL-001", name: "Colar Choker Fita Laminada Ouro 18k", cat: "COLARES", price: 189.90, cost: 65.00, qty: 10, bath: "OURO_18K" },
         { sku: "BEL-BRI-002", name: "Brinco Argola Cravejada Zircônias Ródio", cat: "BRINCOS", price: 129.90, cost: 42.00, qty: 15, bath: "RODIO_BRANCO" },
@@ -1690,37 +1699,91 @@ router.post(
         { sku: "BEL-BRI-010", name: "Brinco Pérola Shell Pendente Ouro 18k", cat: "BRINCOS", price: 119.90, cost: 38.00, qty: 18, bath: "OURO_18K" },
       ];
 
-      for (let i = 0; i < catalogBatch.length; i++) {
-        const item = catalogBatch[i];
-        const prodId = `prod-piloto-${String(i + 1).padStart(2, "0")}`;
-
+      await TenantContext.run({ tenantId: pilotOrgId, isSuperAdmin: true }, async () => {
+        const pilotUserId = "user-piloto-01";
+        // Membership
         await query(
-          `INSERT INTO products (
-            id, organization_id, sku, name, category, collection, material,
-            bath, stones, price, cost_price, warranty_months, is_customizable, status, description
-          ) VALUES (
-            $1, $2, $3, $4, $5, 'COLECAO_PILOTO', 'Semijoia nobre hipoalergênica',
-            $6, '[]'::jsonb, $7, $8, 12, false, 'ATIVO', $9
-          )
-          ON CONFLICT (organization_id, sku) DO UPDATE SET
-            price = $7,
-            status = 'ATIVO'`,
-          [prodId, pilotOrgId, item.sku, item.name, item.cat, item.bath, item.price, item.cost, `${item.name} com banho nobre e verniz antialérgico.`]
+          `INSERT INTO organization_members (id, organization_id, user_id, role, status)
+           VALUES ($1, $2, $3, 'OWNER', 'ACTIVE')
+           ON CONFLICT (organization_id, user_id) DO UPDATE SET role = 'OWNER', status = 'ACTIVE'`,
+          [`mem-${pilotOrgId}-${pilotUserId}`, pilotOrgId, pilotUserId]
         );
 
-        // Saldo Físico inicial
+        // Subscriptions
         await query(
-          `INSERT INTO inventory_balances (
-            id, organization_id, product_id, location_id, on_hand_quantity, reserved_quantity
+          `INSERT INTO subscriptions (
+            id, organization_id, plan_id, status, current_period_start, current_period_end, trial_started_at, trial_ends_at
           ) VALUES (
-            $1, $2, $3, $4, $5, 0
+            $1, $2, 'PRO', 'TRIALING', NOW(), $3, NOW(), $3
           )
-          ON CONFLICT (organization_id, product_id, location_id) DO UPDATE SET
-            on_hand_quantity = $5,
-            reserved_quantity = 0`,
-          [`bal-${pilotOrgId}-${prodId}`, pilotOrgId, prodId, locId, item.qty]
+          ON CONFLICT (organization_id) DO UPDATE SET
+            plan_id = 'PRO',
+            status = 'TRIALING',
+            trial_ends_at = $3`,
+          [`sub-${pilotOrgId}`, pilotOrgId, trialEndsAt]
         );
-      }
+
+        // Location
+        await query(
+          `INSERT INTO inventory_locations (id, organization_id, name, code, type, is_active)
+           VALUES ($1, $2, 'Showroom Matriz Bella Joias', 'MATRIZ', 'PHYSICAL_STORE', true)
+           ON CONFLICT (id) DO NOTHING`,
+          [locId, pilotOrgId]
+        );
+
+        // 10 Produtos e Saldos
+        for (let i = 0; i < catalogBatch.length; i++) {
+          const item = catalogBatch[i];
+          const prodId = `prod-piloto-${String(i + 1).padStart(2, "0")}`;
+
+          await query(
+            `INSERT INTO products (
+              id, organization_id, sku, name, category, collection, material,
+              bath, stones, price, cost_price, warranty_months, is_customizable, status, description
+            ) VALUES (
+              $1, $2, $3, $4, $5, 'COLECAO_PILOTO', 'Semijoia nobre hipoalergênica',
+              $6, '[]'::jsonb, $7, $8, 12, false, 'ATIVO', $9
+            )
+            ON CONFLICT (organization_id, sku) DO UPDATE SET
+              price = $7,
+              status = 'ATIVO'`,
+            [prodId, pilotOrgId, item.sku, item.name, item.cat, item.bath, item.price, item.cost, `${item.name} com banho nobre e verniz antialérgico.`]
+          );
+
+          await query(
+            `INSERT INTO inventory_balances (
+              id, organization_id, product_id, location_id, on_hand_quantity, reserved_quantity
+            ) VALUES (
+              $1, $2, $3, $4, $5, 0
+            )
+            ON CONFLICT (organization_id, product_id, location_id) DO UPDATE SET
+              on_hand_quantity = $5,
+              reserved_quantity = 0`,
+            [`bal-${pilotOrgId}-${prodId}`, pilotOrgId, prodId, locId, item.qty]
+          );
+        }
+      });
+
+      stepsLog.push({
+        step: 1,
+        name: "CRIAR CLIENTE",
+        detail: `Organização '${pilotOrgName}' (${pilotOrgId}) e proprietária '${pilotOwnerName}' criados com sucesso.`,
+        passed: true,
+      });
+
+      stepsLog.push({
+        step: 2,
+        name: "TRIAL 30 DIAS",
+        detail: `Plano PRO vinculado em regime TRIALING. Período de avaliação válido até ${trialEndsAt.toLocaleDateString("pt-BR")}.`,
+        passed: true,
+      });
+
+      stepsLog.push({
+        step: 3,
+        name: "ONBOARDING",
+        detail: `Showroom Matriz configurado, WhatsApp e identidade visual salvos no PostgreSQL.`,
+        passed: true,
+      });
 
       stepsLog.push({
         step: 4,
@@ -1925,16 +1988,18 @@ router.post(
       const durationMs = Date.now() - startTime;
 
       // Auditoria
-      await auditService.logAction(
-        pilotOrgId,
-        req.user!.id,
-        "PILOT_END_TO_END_VERIFIED",
-        "ORDER",
-        paidPilotOrder.id,
-        req.ip,
-        req.headers["user-agent"] as string,
-        `Teste definitivo do Piloto 01 concluído em ${durationMs}ms: todos os 12 passos validados sem intervenção manual.`
-      );
+      await TenantContext.run({ tenantId: pilotOrgId, isSuperAdmin: true }, async () => {
+        await auditService.logAction(
+          pilotOrgId,
+          req.user!.id,
+          "PILOT_END_TO_END_VERIFIED",
+          "ORDER",
+          paidPilotOrder.id,
+          req.ip,
+          req.headers["user-agent"] as string,
+          `Teste definitivo do Piloto 01 concluído em ${durationMs}ms: todos os 12 passos validados sem intervenção manual.`
+        );
+      });
 
       return res.json({
         success: true,
@@ -2062,7 +2127,9 @@ router.post(
       // TESTE 6: Ciclo Comercial de Assinatura (Plano Expirado / Modo Read-Only)
       // Executa validação direta no repositório de assinaturas
       const targetOrgId = "org-lumina-01";
-      const currentSub = await subRepo.findByOrgId(targetOrgId);
+      const currentSub = await TenantContext.run({ tenantId: targetOrgId, isSuperAdmin: true }, async () => {
+        return await subRepo.findByOrgId(targetOrgId);
+      });
       const wasExpiredOrTrialing = currentSub?.status === "TRIALING" || currentSub?.status === "EXPIRED";
 
       testResults.push({
@@ -2110,16 +2177,18 @@ router.post(
       const durationMs = Date.now() - startTime;
 
       // Registra a auditoria formal
-      await auditService.logAction(
-        targetOrgId,
-        req.user!.id,
-        "SECURITY_ACCESS_LIFECYCLE_AUDITED",
-        "ORGANIZATION",
-        targetOrgId,
-        req.ip,
-        req.headers["user-agent"] as string,
-        `Auditoria formal de segurança e ciclo comercial concluída em ${durationMs}ms: todos os ${testResults.length} testes validados com sucesso.`
-      );
+      await TenantContext.run({ tenantId: targetOrgId, isSuperAdmin: true }, async () => {
+        await auditService.logAction(
+          targetOrgId,
+          req.user!.id,
+          "SECURITY_ACCESS_LIFECYCLE_AUDITED",
+          "ORGANIZATION",
+          targetOrgId,
+          req.ip,
+          req.headers["user-agent"] as string,
+          `Auditoria formal de segurança e ciclo comercial concluída em ${durationMs}ms: todos os ${testResults.length} testes validados com sucesso.`
+        );
+      });
 
       return res.json({
         success: true,
@@ -2146,26 +2215,31 @@ router.post(
   requireSuperAdmin(),
   async (_req: AuthenticatedRequest, res) => {
     try {
-      await TenantContext.run({ isSuperAdmin: true }, async () => {
-        await query(`DELETE FROM order_payments`);
-        await query(`DELETE FROM order_items`);
-        await query(`DELETE FROM order_state_transitions`);
-        await query(`DELETE FROM orders`);
-        try { await query(`DELETE FROM consignments`); } catch {}
-        await query(`DELETE FROM inventory_movements`);
-        await query(`DELETE FROM inventory_reservations`);
-        await query(`DELETE FROM inventory_balances`);
-        await query(`DELETE FROM customer_contacts`);
-        await query(`DELETE FROM customer_addresses`);
-        await query(`DELETE FROM customers`);
-        await query(`DELETE FROM product_media`);
-        await query(`DELETE FROM products`);
-        try { await query(`DELETE FROM categories`); } catch {}
-        try { await query(`DELETE FROM billing_webhook_events`); } catch {}
-        try { await query(`DELETE FROM billing_invoices`); } catch {}
-        try { await query(`DELETE FROM idempotency_keys`); } catch {}
-        try { await query(`DELETE FROM audit_logs`); } catch {}
-      });
+      const allOrgs = await TenantContext.run({ isSuperAdmin: true }, () => orgRepo.listAll());
+
+      for (const org of allOrgs) {
+        const orgId = org.id;
+        await TenantContext.run({ tenantId: orgId, isSuperAdmin: true }, async () => {
+          await query(`DELETE FROM order_payments WHERE order_id IN (SELECT id FROM orders WHERE organization_id = $1)`, [orgId]);
+          await query(`DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE organization_id = $1)`, [orgId]);
+          await query(`DELETE FROM order_state_transitions WHERE order_id IN (SELECT id FROM orders WHERE organization_id = $1)`, [orgId]);
+          await query(`DELETE FROM orders WHERE organization_id = $1`, [orgId]);
+          try { await query(`DELETE FROM consignments WHERE organization_id = $1`, [orgId]); } catch {}
+          await query(`DELETE FROM inventory_movements WHERE organization_id = $1`, [orgId]);
+          await query(`DELETE FROM inventory_reservations WHERE organization_id = $1`, [orgId]);
+          await query(`DELETE FROM inventory_balances WHERE organization_id = $1`, [orgId]);
+          await query(`DELETE FROM customer_contacts WHERE customer_id IN (SELECT id FROM customers WHERE organization_id = $1)`, [orgId]);
+          await query(`DELETE FROM customer_addresses WHERE customer_id IN (SELECT id FROM customers WHERE organization_id = $1)`, [orgId]);
+          await query(`DELETE FROM customers WHERE organization_id = $1`, [orgId]);
+          await query(`DELETE FROM product_media WHERE product_id IN (SELECT id FROM products WHERE organization_id = $1)`, [orgId]);
+          await query(`DELETE FROM products WHERE organization_id = $1`, [orgId]);
+          try { await query(`DELETE FROM categories WHERE organization_id = $1`, [orgId]); } catch {}
+          try { await query(`DELETE FROM billing_webhook_events WHERE organization_id = $1`, [orgId]); } catch {}
+          try { await query(`DELETE FROM billing_invoices WHERE organization_id = $1`, [orgId]); } catch {}
+          try { await query(`DELETE FROM idempotency_keys WHERE organization_id = $1`, [orgId]); } catch {}
+          try { await query(`DELETE FROM audit_logs WHERE organization_id = $1`, [orgId]); } catch {}
+        });
+      }
 
       const [orgsCount, usersCount, plansCount] = await Promise.all([
         query("SELECT COUNT(*) FROM organizations"),
@@ -2204,7 +2278,7 @@ router.post(
         return res.status(404).json({ success: false, error: "Organização não encontrada." });
       }
 
-      await TenantContext.run({ isSuperAdmin: true }, async () => {
+      await TenantContext.run({ tenantId: orgId, isSuperAdmin: true }, async () => {
         await query(`DELETE FROM order_payments WHERE order_id IN (SELECT id FROM orders WHERE organization_id = $1)`, [orgId]);
         await query(`DELETE FROM order_items WHERE order_id IN (SELECT id FROM orders WHERE organization_id = $1)`, [orgId]);
         await query(`DELETE FROM order_state_transitions WHERE order_id IN (SELECT id FROM orders WHERE organization_id = $1)`, [orgId]);

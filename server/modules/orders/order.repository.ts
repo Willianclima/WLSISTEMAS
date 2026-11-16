@@ -1,4 +1,4 @@
-import { query, withTransaction } from "../../db/postgres";
+import { query } from "../../db/postgres";
 import { TransactionContext } from "../../db/transaction";
 import {
   OrderEntity,
@@ -117,6 +117,10 @@ function mapRowToTransition(row: any): OrderStateTransitionEntity {
 }
 
 export class OrderRepository {
+  private static getQueryFn(tx?: TransactionContext) {
+    return tx?.pgClient ? tx.pgClient.query.bind(tx.pgClient) : query;
+  }
+
   /**
    * List orders filtered by organization and multi-criteria (PostgreSQL backed)
    */
@@ -185,7 +189,8 @@ export class OrderRepository {
     if (tx && tx.stagedOrders.has(orderId)) {
       return tx.stagedOrders.get(orderId);
     }
-    const res = await query(
+    const queryFn = this.getQueryFn(tx);
+    const res = await queryFn(
       "SELECT * FROM orders WHERE organization_id = $1 AND id = $2",
       [organizationId, orderId]
     );
@@ -212,7 +217,8 @@ export class OrderRepository {
         }
       }
     }
-    const res = await query(
+    const queryFn = this.getQueryFn(tx);
+    const res = await queryFn(
       "SELECT * FROM orders WHERE organization_id = $1 AND idempotency_key = $2",
       [organizationId, key]
     );
@@ -316,7 +322,8 @@ export class OrderRepository {
         }
       }
     }
-    const res = await query(
+    const queryFn = this.getQueryFn(tx);
+    const res = await queryFn(
       "SELECT * FROM order_items WHERE organization_id = $1 AND order_id = $2",
       [organizationId, orderId]
     );
@@ -388,7 +395,8 @@ export class OrderRepository {
         }
       }
     }
-    const res = await query(
+    const queryFn = this.getQueryFn(tx);
+    const res = await queryFn(
       "SELECT * FROM order_payments WHERE organization_id = $1 AND order_id = $2",
       [organizationId, orderId]
     );
@@ -449,7 +457,8 @@ export class OrderRepository {
         }
       }
     }
-    const res = await query(
+    const queryFn = this.getQueryFn(tx);
+    const res = await queryFn(
       "SELECT * FROM order_state_transitions WHERE organization_id = $1 AND order_id = $2 ORDER BY created_at ASC",
       [organizationId, orderId]
     );

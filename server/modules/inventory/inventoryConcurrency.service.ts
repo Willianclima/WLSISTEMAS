@@ -1,7 +1,6 @@
 import { inventoryRepo } from "./inventory.repository";
 import { auditService } from "../../services/auditService";
-import { query } from "../../db/postgres";
-import { IdempotencyService } from "../../services/idempotency.service";
+import { UnitOfWork, TransactionContext } from "../../db/transaction";
 import {
   InventoryBalanceEntity,
   InventoryMovementEntity,
@@ -177,137 +176,129 @@ export class InventoryConcurrencyService {
       ];
 
       const releaseLocks = await this.lockManager.acquireLocks(lockKeys);
-      const createdMovements: string[] = [];
 
       try {
-        // 2. VALIDATE AVAILABILITY UNDER PESSIMISTIC LOCK
-        const balancesToProcess: Array<{
-          balance: InventoryBalanceEntity;
-          qty: number;
-          productId: string;
-        }> = [];
+        return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+          // 2. VALIDATE AVAILABILITY UNDER PESSIMISTIC ROW LOCK (SELECT ... FOR UPDATE)
+          const balancesToProcess: Array<{
+            balance: InventoryBalanceEntity;
+            qty: number;
+            productId: string;
+          }> = [];
 
-        for (const item of items) {
-          if (item.quantity <= 0) {
-            throw new Error(`Quantidade inválida (${item.quantity}) para o produto ${item.productId}.`);
-          }
+          for (const item of items) {
+            if (item.quantity <= 0) {
+              throw new Error(`Quantidade inválida (${item.quantity}) para o produto ${item.productId}.`);
+            }
 
-          const bal = await inventoryRepo.getBalance(orgId, item.productId, locationId);
-          const onHand = bal ? bal.onHandQuantity : 0;
-          const reserved = bal ? bal.reservedQuantity : 0;
-          const available = onHand - reserved;
+            const bal = await inventoryRepo.getBalanceForUpdate(orgId, item.productId, locationId, tx);
+            const onHand = bal ? bal.onHandQuantity : 0;
+            const reserved = bal ? bal.reservedQuantity : 0;
+            const available = onHand - reserved;
 
-          if (available < item.quantity) {
-            throw new Error(
-              `[ESTOQUE INSUFICIENTE] Produto ${item.productId} na localização ${locationId}. Disponível: ${available} un, Solicitado: ${item.quantity} un.`
-            );
-          }
+            if (available < item.quantity) {
+              throw new Error(
+                `[ESTOQUE INSUFICIENTE] Produto ${item.productId} na localização ${locationId}. Disponível: ${available} un, Solicitado: ${item.quantity} un.`
+              );
+            }
 
-          balancesToProcess.push({
-            balance: bal || {
-              id: `bal-${item.productId}-${locationId}`,
-              organizationId: orgId,
+            balancesToProcess.push({
+              balance: bal || {
+                id: `bal-${item.productId}-${locationId}`,
+                organizationId: orgId,
+                productId: item.productId,
+                locationId,
+                onHandQuantity: 0,
+                reservedQuantity: 0,
+                availableQuantity: 0,
+                createdAt: new Date().toISOString(),
+                updatedAt: new Date().toISOString(),
+              },
+              qty: item.quantity,
               productId: item.productId,
-              locationId,
-              onHandQuantity: 0,
-              reservedQuantity: 0,
-              availableQuantity: 0,
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-            },
-            qty: item.quantity,
-            productId: item.productId,
-          });
-        }
-
-        const movements: InventoryMovementEntity[] = [];
-        const updatedBalances: InventoryBalanceEntity[] = [];
-
-        // 3. TRANSACTIONAL PIPELINE: INSERT LEDGER EVENT (Source of Truth) ➔ UPDATE BALANCE PROJECTION
-        for (const target of balancesToProcess) {
-          const movementId = `mov-order-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-          createdMovements.push(movementId);
-
-          let updatedBalance: InventoryBalanceEntity;
-
-          if (mode === "DIRECT_SALE") {
-            // A. Gravar Evento Histórico no Ledger (Fonte da Verdade)
-            const mov: InventoryMovementEntity = {
-              id: movementId,
-              organizationId: orgId,
-              productId: target.productId,
-              locationId,
-              type: "SALE",
-              quantityChange: -target.qty,
-              physicalBalanceAfter: 0,
-              consignedBalanceAfter: 0,
-              onHandAfter: 0,
-              reservedAfter: 0,
-              availableAfter: 0,
-              referenceType: "ORDER",
-              referenceId: orderId,
-              operatorName: operatorName || "Sistema de Pedidos / PDV",
-              notes: notes || `Venda referente ao Pedido #${orderId}`,
-              createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
-            };
-            await inventoryRepo.createMovement(mov);
-            movements.push(mov);
-
-            // B. Atualizar Projeção Operacional de Saldo (inventory_balances)
-            updatedBalance = await inventoryRepo.adjustOnHand(orgId, target.productId, locationId, -target.qty);
-          } else {
-            // Reserva temporária de Checkout
-            const mov: InventoryMovementEntity = {
-              id: movementId,
-              organizationId: orgId,
-              productId: target.productId,
-              locationId,
-              type: "RESERVATION_HOLD",
-              quantityChange: target.qty,
-              physicalBalanceAfter: 0,
-              consignedBalanceAfter: 0,
-              onHandAfter: 0,
-              reservedAfter: 0,
-              availableAfter: 0,
-              referenceType: "CHECKOUT_RESERVATION",
-              referenceId: orderId,
-              operatorName: operatorName || "Checkout E-commerce",
-              notes: notes || `Reserva temporária para checkout do Pedido #${orderId}`,
-              createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
-            };
-            await inventoryRepo.createMovement(mov);
-            movements.push(mov);
-
-            // Atualiza reserva na projeção
-            updatedBalance = await inventoryRepo.reserveStock(orgId, target.productId, locationId, target.qty);
+            });
           }
 
-          updatedBalances.push(updatedBalance);
-        }
+          const movements: InventoryMovementEntity[] = [];
+          const updatedBalances: InventoryBalanceEntity[] = [];
 
-        // 4. INSERT AUDIT LOG
-        await auditService.logAction(
-          orgId,
-          userId,
-          mode === "DIRECT_SALE" ? "COMPOSITE_ORDER_SALE" : "COMPOSITE_ORDER_RESERVE",
-          "ORDER_INVENTORY",
-          orderId,
-          "127.0.0.1",
-          "InventoryConcurrencyService",
-          `Operação composta executada com Lock (SELECT FOR UPDATE) para ${items.length} itens do Pedido #${orderId}.`,
-          { items, mode }
-        );
+          // 3. TRANSACTIONAL PIPELINE: STAGE LEDGER EVENT -> UPDATE BALANCE PROJECTION
+          for (const target of balancesToProcess) {
+            const movementId = `mov-order-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+            let updatedBalance: InventoryBalanceEntity;
 
-        return {
-          orderId,
-          movements,
-          updatedBalances,
-        };
+            if (mode === "DIRECT_SALE") {
+              const mov: InventoryMovementEntity = {
+                id: movementId,
+                organizationId: orgId,
+                productId: target.productId,
+                locationId,
+                type: "SALE",
+                quantityChange: -target.qty,
+                physicalBalanceAfter: 0,
+                consignedBalanceAfter: 0,
+                onHandAfter: 0,
+                reservedAfter: 0,
+                availableAfter: 0,
+                referenceType: "ORDER",
+                referenceId: orderId,
+                operatorName: operatorName || "Sistema de Pedidos / PDV",
+                notes: notes || `Venda referente ao Pedido #${orderId}`,
+                createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+              };
+              await inventoryRepo.createMovement(mov, tx);
+              movements.push(mov);
+
+              updatedBalance = await inventoryRepo.adjustOnHand(orgId, target.productId, locationId, -target.qty, tx);
+            } else {
+              const mov: InventoryMovementEntity = {
+                id: movementId,
+                organizationId: orgId,
+                productId: target.productId,
+                locationId,
+                type: "RESERVATION_HOLD",
+                quantityChange: target.qty,
+                physicalBalanceAfter: 0,
+                consignedBalanceAfter: 0,
+                onHandAfter: 0,
+                reservedAfter: 0,
+                availableAfter: 0,
+                referenceType: "CHECKOUT_RESERVATION",
+                referenceId: orderId,
+                operatorName: operatorName || "Checkout E-commerce",
+                notes: notes || `Reserva temporária para checkout do Pedido #${orderId}`,
+                createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+              };
+              await inventoryRepo.createMovement(mov, tx);
+              movements.push(mov);
+
+              updatedBalance = await inventoryRepo.reserveStock(orgId, target.productId, locationId, target.qty, tx);
+            }
+
+            updatedBalances.push(updatedBalance);
+          }
+
+          // 4. INSERT AUDIT LOG ON SAME CONNECTION
+          await auditService.logAction(
+            orgId,
+            userId,
+            mode === "DIRECT_SALE" ? "COMPOSITE_ORDER_SALE" : "COMPOSITE_ORDER_RESERVE",
+            "ORDER_INVENTORY",
+            orderId,
+            "127.0.0.1",
+            "InventoryConcurrencyService",
+            `Operação composta executada com Lock (SELECT FOR UPDATE) para ${items.length} itens do Pedido #${orderId}.`,
+            { items, mode },
+            { tx }
+          );
+
+          return {
+            orderId,
+            movements,
+            updatedBalances,
+          };
+        });
       } catch (error: any) {
-        // Rollback transacional
-        for (const movId of createdMovements) {
-          await inventoryRepo.removeMovement(movId);
-        }
         throw new Error(`[TRANSACTION_FAILED] Falha na operação composta de pedido: ${error.message}`);
       } finally {
         releaseLocks();
@@ -337,70 +328,65 @@ export class InventoryConcurrencyService {
       ];
 
       const releaseLocks = await this.lockManager.acquireLocks(lockKeys);
-      const createdMovements: string[] = [];
 
       try {
-        const movements: InventoryMovementEntity[] = [];
+        return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+          const movements: InventoryMovementEntity[] = [];
 
-        for (const item of items) {
-          const sourceBal = await inventoryRepo.getBalance(orgId, item.productId, sourceLocationId);
-          const available = sourceBal ? sourceBal.onHandQuantity - sourceBal.reservedQuantity : 0;
+          for (const item of items) {
+            const sourceBal = await inventoryRepo.getBalanceForUpdate(orgId, item.productId, sourceLocationId, tx);
+            const available = sourceBal ? sourceBal.onHandQuantity - sourceBal.reservedQuantity : 0;
 
-          if (available < item.quantity) {
-            throw new Error(
-              `[ESTOQUE INSUFICIENTE NA MATRIZ] Produto ${item.productId}. Disponível: ${available} un, Solicitado: ${item.quantity} un.`
-            );
+            if (available < item.quantity) {
+              throw new Error(
+                `[ESTOQUE INSUFICIENTE NA MATRIZ] Produto ${item.productId}. Disponível: ${available} un, Solicitado: ${item.quantity} un.`
+              );
+            }
+
+            const movementId = `mov-cng-out-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+
+            const mov: InventoryMovementEntity = {
+              id: movementId,
+              organizationId: orgId,
+              productId: item.productId,
+              locationId: sourceLocationId,
+              type: "CONSIGNMENT_OUT",
+              quantityChange: item.quantity,
+              physicalBalanceAfter: 0,
+              consignedBalanceAfter: 0,
+              onHandAfter: 0,
+              reservedAfter: 0,
+              availableAfter: 0,
+              referenceType: "CONSIGNMENT",
+              referenceId: consignmentId,
+              operatorName: operatorName || "Expedição de Consignação",
+              notes: notes || `Envio de ${item.quantity} un para maleta ${bagLocationId} (Revendedora #${resellerId})`,
+              createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+            };
+
+            await inventoryRepo.createMovement(mov, tx);
+            movements.push(mov);
+
+            await inventoryRepo.adjustOnHand(orgId, item.productId, sourceLocationId, -item.quantity, tx);
+            await inventoryRepo.adjustOnHand(orgId, item.productId, bagLocationId, item.quantity, tx);
           }
 
-          const movementId = `mov-cng-out-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-          createdMovements.push(movementId);
+          await auditService.logAction(
+            orgId,
+            undefined,
+            "COMPOSITE_CONSIGNMENT_DISPATCH",
+            "CONSIGNMENT",
+            consignmentId,
+            "127.0.0.1",
+            "InventoryConcurrencyService",
+            `Consignação #${consignmentId} despachada com locks pessimistas para ${items.length} produtos.`,
+            { items, resellerId, sourceLocationId, bagLocationId },
+            { tx }
+          );
 
-          // 1. LEDGER EVENT (Fonte da Verdade)
-          const mov: InventoryMovementEntity = {
-            id: movementId,
-            organizationId: orgId,
-            productId: item.productId,
-            locationId: sourceLocationId,
-            type: "CONSIGNMENT_OUT",
-            quantityChange: item.quantity,
-            physicalBalanceAfter: 0,
-            consignedBalanceAfter: 0,
-            onHandAfter: 0,
-            reservedAfter: 0,
-            availableAfter: 0,
-            referenceType: "CONSIGNMENT",
-            referenceId: consignmentId,
-            operatorName: operatorName || "Expedição de Consignação",
-            notes: notes || `Envio de ${item.quantity} un para maleta ${bagLocationId} (Revendedora #${resellerId})`,
-            createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
-          };
-
-          await inventoryRepo.createMovement(mov);
-          movements.push(mov);
-
-          // 2. UPDATE BALANCE PROJECTIONS (Matriz e Maleta)
-          await inventoryRepo.adjustOnHand(orgId, item.productId, sourceLocationId, -item.quantity);
-          await inventoryRepo.adjustOnHand(orgId, item.productId, bagLocationId, item.quantity);
-        }
-
-        // 3. AUDIT
-        await auditService.logAction(
-          orgId,
-          undefined,
-          "COMPOSITE_CONSIGNMENT_DISPATCH",
-          "CONSIGNMENT",
-          consignmentId,
-          "127.0.0.1",
-          "InventoryConcurrencyService",
-          `Consignação #${consignmentId} despachada com locks pessimistas para ${items.length} produtos.`,
-          { items, resellerId, sourceLocationId, bagLocationId }
-        );
-
-        return { consignmentId, movements };
+          return { consignmentId, movements };
+        });
       } catch (err: any) {
-        for (const movId of createdMovements) {
-          await inventoryRepo.removeMovement(movId);
-        }
         throw new Error(`[TRANSACTION_FAILED] Falha ao despachar consignação: ${err.message}`);
       } finally {
         releaseLocks();
@@ -430,70 +416,65 @@ export class InventoryConcurrencyService {
       ];
 
       const releaseLocks = await this.lockManager.acquireLocks(lockKeys);
-      const createdMovements: string[] = [];
 
       try {
-        const movements: InventoryMovementEntity[] = [];
+        return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+          const movements: InventoryMovementEntity[] = [];
 
-        for (const item of items) {
-          const sourceBal = await inventoryRepo.getBalance(orgId, item.productId, sourceLocationId);
-          const available = sourceBal ? sourceBal.onHandQuantity - sourceBal.reservedQuantity : 0;
+          for (const item of items) {
+            const sourceBal = await inventoryRepo.getBalanceForUpdate(orgId, item.productId, sourceLocationId, tx);
+            const available = sourceBal ? sourceBal.onHandQuantity - sourceBal.reservedQuantity : 0;
 
-          if (available < item.quantity) {
-            throw new Error(
-              `[TRANSFERÊNCIA REJEITADA] Saldo insuficiente no local de origem. Disponível: ${available} un, Solicitado: ${item.quantity} un.`
-            );
+            if (available < item.quantity) {
+              throw new Error(
+                `[TRANSFERÊNCIA REJEITADA] Saldo insuficiente no local de origem. Disponível: ${available} un, Solicitado: ${item.quantity} un.`
+              );
+            }
+
+            const movementId = `mov-transf-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+
+            const mov: InventoryMovementEntity = {
+              id: movementId,
+              organizationId: orgId,
+              productId: item.productId,
+              locationId: sourceLocationId,
+              type: "TRANSFER",
+              quantityChange: item.quantity,
+              physicalBalanceAfter: 0,
+              consignedBalanceAfter: 0,
+              onHandAfter: 0,
+              reservedAfter: 0,
+              availableAfter: 0,
+              referenceType: "TRANSFER",
+              referenceId: transferId,
+              operatorName: operatorName || "Logística Interna",
+              notes: notes || `Transferência de ${item.quantity} un do local ${sourceLocationId} para ${targetLocationId}`,
+              createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+            };
+
+            await inventoryRepo.createMovement(mov, tx);
+            movements.push(mov);
+
+            await inventoryRepo.adjustOnHand(orgId, item.productId, sourceLocationId, -item.quantity, tx);
+            await inventoryRepo.adjustOnHand(orgId, item.productId, targetLocationId, item.quantity, tx);
           }
 
-          const movementId = `mov-transf-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-          createdMovements.push(movementId);
+          await auditService.logAction(
+            orgId,
+            undefined,
+            "COMPOSITE_STOCK_TRANSFER",
+            "TRANSFER",
+            transferId,
+            "127.0.0.1",
+            "InventoryConcurrencyService",
+            `Transferência #${transferId} executada com lock garantindo não-negatividade e integridade.`,
+            { items, sourceLocationId, targetLocationId },
+            { tx }
+          );
 
-          // 1. LEDGER EVENT
-          const mov: InventoryMovementEntity = {
-            id: movementId,
-            organizationId: orgId,
-            productId: item.productId,
-            locationId: sourceLocationId,
-            type: "TRANSFER",
-            quantityChange: item.quantity,
-            physicalBalanceAfter: 0,
-            consignedBalanceAfter: 0,
-            onHandAfter: 0,
-            reservedAfter: 0,
-            availableAfter: 0,
-            referenceType: "TRANSFER",
-            referenceId: transferId,
-            operatorName: operatorName || "Logística Interna",
-            notes: notes || `Transferência de ${item.quantity} un do local ${sourceLocationId} para ${targetLocationId}`,
-            createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
-          };
-
-          await inventoryRepo.createMovement(mov);
-          movements.push(mov);
-
-          // 2. UPDATE BALANCE PROJECTIONS
-          await inventoryRepo.adjustOnHand(orgId, item.productId, sourceLocationId, -item.quantity);
-          await inventoryRepo.adjustOnHand(orgId, item.productId, targetLocationId, item.quantity);
-        }
-
-        // 3. AUDIT
-        await auditService.logAction(
-          orgId,
-          undefined,
-          "COMPOSITE_STOCK_TRANSFER",
-          "TRANSFER",
-          transferId,
-          "127.0.0.1",
-          "InventoryConcurrencyService",
-          `Transferência #${transferId} executada com lock garantindo não-negatividade e integridade.`,
-          { items, sourceLocationId, targetLocationId }
-        );
-
-        return { transferId, movements };
+          return { transferId, movements };
+        });
       } catch (err: any) {
-        for (const movId of createdMovements) {
-          await inventoryRepo.removeMovement(movId);
-        }
         throw new Error(`[TRANSACTION_FAILED] Falha na transferência entre locais: ${err.message}`);
       } finally {
         releaseLocks();
@@ -520,60 +501,55 @@ export class InventoryConcurrencyService {
       ];
 
       const releaseLocks = await this.lockManager.acquireLocks(lockKeys);
-      const createdMovements: string[] = [];
 
       try {
-        const movements: InventoryMovementEntity[] = [];
+        return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+          const movements: InventoryMovementEntity[] = [];
 
-        for (const item of items) {
-          const movementId = `mov-cancel-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-          createdMovements.push(movementId);
+          for (const item of items) {
+            const movementId = `mov-cancel-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 
-          // 1. LEDGER EVENT
-          const mov: InventoryMovementEntity = {
-            id: movementId,
-            organizationId: orgId,
-            productId: item.productId,
-            locationId,
-            type: "REVERSAL",
-            quantityChange: item.quantity,
-            physicalBalanceAfter: 0,
-            consignedBalanceAfter: 0,
-            onHandAfter: 0,
-            reservedAfter: 0,
-            availableAfter: 0,
-            referenceType: referenceType === "ORDER" ? "ORDER" : "REVERSAL_OPERATION",
+            const mov: InventoryMovementEntity = {
+              id: movementId,
+              organizationId: orgId,
+              productId: item.productId,
+              locationId,
+              type: "REVERSAL",
+              quantityChange: item.quantity,
+              physicalBalanceAfter: 0,
+              consignedBalanceAfter: 0,
+              onHandAfter: 0,
+              reservedAfter: 0,
+              availableAfter: 0,
+              referenceType: referenceType === "ORDER" ? "ORDER" : "REVERSAL_OPERATION",
+              referenceId,
+              operatorName: operatorName || "Cancelamento & Reversão",
+              notes: `Cancelamento de ${referenceType} #${referenceId}. Motivo: ${reason}`,
+              createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+            };
+
+            await inventoryRepo.createMovement(mov, tx);
+            movements.push(mov);
+
+            await inventoryRepo.adjustOnHand(orgId, item.productId, locationId, item.quantity, tx);
+          }
+
+          await auditService.logAction(
+            orgId,
+            userId,
+            "COMPOSITE_CANCELLATION_REVERSAL",
+            referenceType,
             referenceId,
-            operatorName: operatorName || "Cancelamento & Reversão",
-            notes: `Cancelamento de ${referenceType} #${referenceId}. Motivo: ${reason}`,
-            createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
-          };
+            "127.0.0.1",
+            "InventoryConcurrencyService",
+            `Cancelamento e estorno transacional executados para ${referenceType} #${referenceId}.`,
+            { items, reason },
+            { tx }
+          );
 
-          await inventoryRepo.createMovement(mov);
-          movements.push(mov);
-
-          // 2. RESTORE BALANCE PROJECTION
-          await inventoryRepo.adjustOnHand(orgId, item.productId, locationId, item.quantity);
-        }
-
-        // 3. AUDIT
-        await auditService.logAction(
-          orgId,
-          userId,
-          "COMPOSITE_CANCELLATION_REVERSAL",
-          referenceType,
-          referenceId,
-          "127.0.0.1",
-          "InventoryConcurrencyService",
-          `Cancelamento e estorno transacional executados para ${referenceType} #${referenceId}.`,
-          { items, reason }
-        );
-
-        return { referenceId, movements };
+          return { referenceId, movements };
+        });
       } catch (err: any) {
-        for (const movId of createdMovements) {
-          await inventoryRepo.removeMovement(movId);
-        }
         throw new Error(`[TRANSACTION_FAILED] Falha no cancelamento/estorno: ${err.message}`);
       } finally {
         releaseLocks();
@@ -601,60 +577,55 @@ export class InventoryConcurrencyService {
       ];
 
       const releaseLocks = await this.lockManager.acquireLocks(lockKeys);
-      const createdMovements: string[] = [];
 
       try {
-        const movements: InventoryMovementEntity[] = [];
+        return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+          const movements: InventoryMovementEntity[] = [];
 
-        for (const item of items) {
-          const movementId = `mov-pay-commit-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-          createdMovements.push(movementId);
+          for (const item of items) {
+            const movementId = `mov-pay-commit-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
 
-          // 1. LEDGER EVENT (Venda Final)
-          const mov: InventoryMovementEntity = {
-            id: movementId,
-            organizationId: orgId,
-            productId: item.productId,
-            locationId,
-            type: "SALE",
-            quantityChange: -item.quantity,
-            physicalBalanceAfter: 0,
-            consignedBalanceAfter: 0,
-            onHandAfter: 0,
-            reservedAfter: 0,
-            availableAfter: 0,
-            referenceType: "ORDER",
-            referenceId: orderId,
-            operatorName: operatorName || "Gateway de Pagamento / Faturamento",
-            notes: `Pagamento #${paymentId} confirmado. Baixa definitiva da reserva de ${item.quantity} un.`,
-            createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
-          };
+            const mov: InventoryMovementEntity = {
+              id: movementId,
+              organizationId: orgId,
+              productId: item.productId,
+              locationId,
+              type: "SALE",
+              quantityChange: -item.quantity,
+              physicalBalanceAfter: 0,
+              consignedBalanceAfter: 0,
+              onHandAfter: 0,
+              reservedAfter: 0,
+              availableAfter: 0,
+              referenceType: "ORDER",
+              referenceId: orderId,
+              operatorName: operatorName || "Gateway de Pagamento / Faturamento",
+              notes: `Pagamento #${paymentId} confirmado. Baixa definitiva da reserva de ${item.quantity} un.`,
+              createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+            };
 
-          await inventoryRepo.createMovement(mov);
-          movements.push(mov);
+            await inventoryRepo.createMovement(mov, tx);
+            movements.push(mov);
 
-          // 2. COMMIT BALANCE (baixa simultânea de on_hand e reserved)
-          await inventoryRepo.commitReservation(orgId, item.productId, locationId, item.quantity);
-        }
+            await inventoryRepo.commitReservation(orgId, item.productId, locationId, item.quantity, tx);
+          }
 
-        // 3. AUDIT
-        await auditService.logAction(
-          orgId,
-          userId,
-          "COMPOSITE_PAYMENT_CONFIRMATION",
-          "PAYMENT",
-          paymentId,
-          "127.0.0.1",
-          "InventoryConcurrencyService",
-          `Pagamento #${paymentId} confirmado com lock, convertendo reserva em faturamento para o Pedido #${orderId}.`,
-          { items, orderId, paymentId }
-        );
+          await auditService.logAction(
+            orgId,
+            userId,
+            "COMPOSITE_PAYMENT_CONFIRMATION",
+            "PAYMENT",
+            paymentId,
+            "127.0.0.1",
+            "InventoryConcurrencyService",
+            `Pagamento #${paymentId} confirmado com lock, convertendo reserva em faturamento para o Pedido #${orderId}.`,
+            { items, orderId, paymentId },
+            { tx }
+          );
 
-        return { orderId, movements };
+          return { orderId, movements };
+        });
       } catch (err: any) {
-        for (const movId of createdMovements) {
-          await inventoryRepo.removeMovement(movId);
-        }
         throw new Error(`[TRANSACTION_FAILED] Falha ao confirmar pagamento e baixar reserva: ${err.message}`);
       } finally {
         releaseLocks();
@@ -705,99 +676,87 @@ export class InventoryConcurrencyService {
       const lockKey = `balance:${orgId}:${productId}:${locationId}`;
       const releaseLock = await this.lockManager.acquireLocks([lockKey]);
 
-      let balanceUpdated = false;
-      let createdRecord: InventoryReservationEntity | null = null;
-
       try {
-        // 2. ATOMIC VERIFICATION UNDER ROW LOCK (SELECT ... FOR UPDATE)
-        let bal = await inventoryRepo.getBalanceForUpdate(orgId, productId, locationId);
-        if (!bal) {
-          bal = {
-            id: `bal-${productId}-${locationId}`,
+        return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+          if (idempotencyKey) {
+            const existing = await inventoryRepo.findReservationByIdempotencyKey(orgId, idempotencyKey, tx);
+            if (existing) {
+              return existing;
+            }
+          }
+
+          // 2. ATOMIC VERIFICATION UNDER ROW LOCK (SELECT ... FOR UPDATE)
+          let bal = await inventoryRepo.getBalanceForUpdate(orgId, productId, locationId, tx);
+          if (!bal) {
+            bal = {
+              id: `bal-${productId}-${locationId}`,
+              organizationId: orgId,
+              productId,
+              locationId,
+              onHandQuantity: 0,
+              reservedQuantity: 0,
+              availableQuantity: 0,
+              createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
+            };
+          }
+
+          const available = bal.onHandQuantity - bal.reservedQuantity;
+          if (available < quantity) {
+            throw new Error(
+              `Saldo insuficiente para reserva na localização. Disponível: ${available} un, Solicitado: ${quantity} un (Físico On-Hand: ${bal.onHandQuantity}, Já Reservado: ${bal.reservedQuantity}).`
+            );
+          }
+
+          // 3. ATOMIC DECREMENT OF AVAILABLE STOCK
+          const updatedBal: InventoryBalanceEntity = {
+            ...bal,
+            reservedQuantity: bal.reservedQuantity + quantity,
+            availableQuantity: bal.onHandQuantity - (bal.reservedQuantity + quantity),
+            updatedAt: new Date().toISOString(),
+          };
+
+          await inventoryRepo.upsertBalance(updatedBal, tx);
+
+          // 4. CRIAÇÃO DO REGISTRO FORMAL DE RESERVA (STATUS: ACTIVE)
+          const now = new Date();
+          const expiresAt = new Date(now.getTime() + ttlMinutes * 60000).toISOString();
+
+          const reservation: InventoryReservationEntity = {
+            id: `res-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
             organizationId: orgId,
             productId,
             locationId,
-            onHandQuantity: 0,
-            reservedQuantity: 0,
-            availableQuantity: 0,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
+            quantity,
+            status: "ACTIVE",
+            referenceType,
+            referenceId,
+            idempotencyKey,
+            expiresAt,
+            operatorName,
+            notes,
+            createdAt: now.toISOString(),
+            updatedAt: now.toISOString(),
           };
-        }
 
-        const available = bal.onHandQuantity - bal.reservedQuantity;
-        if (available < quantity) {
-          throw new Error(
-            `Saldo insuficiente para reserva na localização. Disponível: ${available} un, Solicitado: ${quantity} un (Físico On-Hand: ${bal.onHandQuantity}, Já Reservado: ${bal.reservedQuantity}).`
+          const createdRecord = await inventoryRepo.createReservationRecord(reservation, tx);
+
+          // 5. REGISTRO DE AUDITORIA TRANSACIONAL NA MESMA CONEXÃO
+          await auditService.logAction(
+            orgId,
+            undefined,
+            "FORMAL_RESERVATION_CREATED",
+            referenceType,
+            referenceId,
+            "127.0.0.1",
+            operatorName || "InventoryConcurrencyService",
+            `Reserva formal #${createdRecord.id} de ${quantity} un criada com lock FOR UPDATE e TTL de ${ttlMinutes}m (Expira em: ${expiresAt}).`,
+            { productId, locationId, quantity, expiresAt, idempotencyKey },
+            { tx }
           );
-        }
 
-        // 3. ATOMIC DECREMENT OF AVAILABLE STOCK (UPDATE inventory_balances SET reserved_quantity = reserved_quantity + qty)
-        const updatedBal: InventoryBalanceEntity = {
-          ...bal,
-          reservedQuantity: bal.reservedQuantity + quantity,
-          availableQuantity: bal.onHandQuantity - (bal.reservedQuantity + quantity),
-          updatedAt: new Date().toISOString(),
-        };
-
-        // Valida restrições CHECK de integridade no banco
-        await inventoryRepo.upsertBalance(updatedBal);
-        balanceUpdated = true;
-
-        // 4. CRIAÇÃO DO REGISTRO FORMAL DE RESERVA (STATUS: ACTIVE)
-        const now = new Date();
-        const expiresAt = new Date(now.getTime() + ttlMinutes * 60000).toISOString();
-
-        const reservation: InventoryReservationEntity = {
-          id: `res-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
-          organizationId: orgId,
-          productId,
-          locationId,
-          quantity,
-          status: "ACTIVE",
-          referenceType,
-          referenceId,
-          idempotencyKey,
-          expiresAt,
-          operatorName,
-          notes,
-          createdAt: now.toISOString(),
-          updatedAt: now.toISOString(),
-        };
-
-        createdRecord = await inventoryRepo.createReservationRecord(reservation);
-
-        // 5. REGISTRO DE AUDITORIA TRANSACIONAL
-        await auditService.logAction(
-          orgId,
-          undefined,
-          "FORMAL_RESERVATION_CREATED",
-          referenceType,
-          referenceId,
-          "127.0.0.1",
-          operatorName || "InventoryConcurrencyService",
-          `Reserva formal #${createdRecord.id} de ${quantity} un criada com lock FOR UPDATE e TTL de ${ttlMinutes}m (Expira em: ${expiresAt}).`,
-          { productId, locationId, quantity, expiresAt, idempotencyKey }
-        );
-
-        return createdRecord;
-      } catch (err: any) {
-        // Rollback da transação em caso de erro intermediário
-        if (balanceUpdated) {
-          try {
-            await inventoryRepo.releaseReservation(orgId, productId, locationId, quantity);
-          } catch (rbErr) {
-            console.error(`[ROLLBACK_ERROR] Falha ao reverter saldo reservado:`, rbErr);
-          }
-        }
-        if (createdRecord) {
-          try {
-            await query("DELETE FROM inventory_reservations WHERE id = $1", [createdRecord.id]);
-          } catch (rbErr) {
-            console.error(`[ROLLBACK_ERROR] Falha ao remover registro de reserva:`, rbErr);
-          }
-        }
-        throw err;
+          return createdRecord;
+        });
       } finally {
         releaseLock();
       }
@@ -827,76 +786,63 @@ export class InventoryConcurrencyService {
     ];
     const releaseLock = await this.lockManager.acquireLocks(lockKeys);
 
-    let balanceCommitted = false;
-    let movementCreatedId: string | null = null;
-
     try {
-      // Re-verificar status sob lock
-      const fresh = await inventoryRepo.findReservationById(orgId, reservationId);
-      if (!fresh || fresh.status !== "ACTIVE") {
-        throw new Error(`Reserva #${reservationId} já foi alterada por outra operação (status: ${fresh?.status}).`);
-      }
-
-      // 1. Baixa em inventory_balances (on_hand -= qty, reserved -= qty)
-      await inventoryRepo.commitReservation(orgId, fresh.productId, fresh.locationId, fresh.quantity);
-      balanceCommitted = true;
-
-      // 2. Registra no Ledger Imutável
-      const movementId = `mov-res-conf-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-      const mov: InventoryMovementEntity = {
-        id: movementId,
-        organizationId: orgId,
-        productId: fresh.productId,
-        locationId: fresh.locationId,
-        type: "SALE",
-        quantityChange: -fresh.quantity,
-        physicalBalanceAfter: 0,
-        consignedBalanceAfter: 0,
-        onHandAfter: 0,
-        reservedAfter: 0,
-        availableAfter: 0,
-        referenceType: fresh.referenceType,
-        referenceId: fresh.referenceId,
-        operatorName: operatorName || fresh.operatorName || "Sistema",
-        notes: `Confirmação definitiva da reserva #${reservationId}`,
-        createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
-      };
-      await inventoryRepo.createMovement(mov);
-      movementCreatedId = movementId;
-
-      // 3. Atualiza status da reserva para CONFIRMED
-      const updated = await inventoryRepo.updateReservationStatus(orgId, reservationId, "CONFIRMED", {
-        confirmedAt: new Date().toISOString(),
-      });
-
-      // 4. Log de auditoria
-      await auditService.logAction(
-        orgId,
-        undefined,
-        "FORMAL_RESERVATION_CONFIRMED",
-        fresh.referenceType,
-        fresh.referenceId,
-        "127.0.0.1",
-        operatorName || "InventoryConcurrencyService",
-        `Reserva #${reservationId} confirmada. Faturamento e baixa física de ${fresh.quantity} un efetivados.`,
-        { reservationId, quantity: fresh.quantity, movementId }
-      );
-
-      return updated!;
-    } catch (err: any) {
-      if (movementCreatedId) {
-        await inventoryRepo.removeMovement(movementCreatedId);
-      }
-      if (balanceCommitted) {
-        // Rollback balance commit
-        try {
-          await inventoryRepo.adjustOnHand(orgId, reservation.productId, reservation.locationId, reservation.quantity);
-          await inventoryRepo.reserveStock(orgId, reservation.productId, reservation.locationId, reservation.quantity);
-        } catch (rbErr) {
-          console.error(`[ROLLBACK_ERROR] Falha ao reverter commit de saldo:`, rbErr);
+      return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+        const fresh = await inventoryRepo.findReservationById(orgId, reservationId, tx);
+        if (!fresh || fresh.status !== "ACTIVE") {
+          throw new Error(`Reserva #${reservationId} já foi alterada por outra operação (status: ${fresh?.status}).`);
         }
-      }
-      throw err;
+
+        // 1. Baixa em inventory_balances (on_hand -= qty, reserved -= qty)
+        await inventoryRepo.commitReservation(orgId, fresh.productId, fresh.locationId, fresh.quantity, tx);
+
+        // 2. Registra no Ledger Imutável
+        const movementId = `mov-res-conf-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+        const mov: InventoryMovementEntity = {
+          id: movementId,
+          organizationId: orgId,
+          productId: fresh.productId,
+          locationId: fresh.locationId,
+          type: "SALE",
+          quantityChange: -fresh.quantity,
+          physicalBalanceAfter: 0,
+          consignedBalanceAfter: 0,
+          onHandAfter: 0,
+          reservedAfter: 0,
+          availableAfter: 0,
+          referenceType: fresh.referenceType,
+          referenceId: fresh.referenceId,
+          operatorName: operatorName || fresh.operatorName || "Sistema",
+          notes: `Confirmação definitiva da reserva #${reservationId}`,
+          createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+        };
+        await inventoryRepo.createMovement(mov, tx);
+
+        // 3. Atualiza status da reserva para CONFIRMED
+        const updated = await inventoryRepo.updateReservationStatus(
+          orgId,
+          reservationId,
+          "CONFIRMED",
+          { confirmedAt: new Date().toISOString() },
+          tx
+        );
+
+        // 4. Log de auditoria
+        await auditService.logAction(
+          orgId,
+          undefined,
+          "FORMAL_RESERVATION_CONFIRMED",
+          fresh.referenceType,
+          fresh.referenceId,
+          "127.0.0.1",
+          operatorName || "InventoryConcurrencyService",
+          `Reserva #${reservationId} confirmada. Faturamento e baixa física de ${fresh.quantity} un efetivados.`,
+          { reservationId, quantity: fresh.quantity, movementId },
+          { tx }
+        );
+
+        return updated!;
+      });
     } finally {
       releaseLock();
     }
@@ -925,45 +871,41 @@ export class InventoryConcurrencyService {
     ];
     const releaseLock = await this.lockManager.acquireLocks(lockKeys);
 
-    let balanceReleased = false;
-
     try {
-      // Re-verificar status sob lock
-      const fresh = await inventoryRepo.findReservationById(orgId, reservationId);
-      if (!fresh || fresh.status !== "ACTIVE") {
-        throw new Error(`Reserva #${reservationId} não está mais ativa (status atual: ${fresh?.status}).`);
-      }
-
-      await inventoryRepo.releaseReservation(orgId, fresh.productId, fresh.locationId, fresh.quantity);
-      balanceReleased = true;
-
-      const updated = await inventoryRepo.updateReservationStatus(orgId, reservationId, "RELEASED", {
-        releasedAt: new Date().toISOString(),
-        notes: reason ? `${fresh.notes || ""} [Liberação: ${reason}]`.trim() : fresh.notes,
-      });
-
-      await auditService.logAction(
-        orgId,
-        undefined,
-        "FORMAL_RESERVATION_RELEASED",
-        fresh.referenceType,
-        fresh.referenceId,
-        "127.0.0.1",
-        "InventoryConcurrencyService",
-        `Reserva #${reservationId} liberada. ${fresh.quantity} un devolvidas ao saldo disponível. Motivo: ${reason || "Cancelamento"}`,
-        { reservationId, quantity: fresh.quantity }
-      );
-
-      return updated!;
-    } catch (err: any) {
-      if (balanceReleased) {
-        try {
-          await inventoryRepo.reserveStock(orgId, reservation.productId, reservation.locationId, reservation.quantity);
-        } catch (rbErr) {
-          console.error(`[ROLLBACK_ERROR] Falha ao reverter release de saldo:`, rbErr);
+      return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+        const fresh = await inventoryRepo.findReservationById(orgId, reservationId, tx);
+        if (!fresh || fresh.status !== "ACTIVE") {
+          throw new Error(`Reserva #${reservationId} não está mais ativa (status atual: ${fresh?.status}).`);
         }
-      }
-      throw err;
+
+        await inventoryRepo.releaseReservation(orgId, fresh.productId, fresh.locationId, fresh.quantity, tx);
+
+        const updated = await inventoryRepo.updateReservationStatus(
+          orgId,
+          reservationId,
+          "RELEASED",
+          {
+            releasedAt: new Date().toISOString(),
+            notes: reason ? `${fresh.notes || ""} [Liberação: ${reason}]`.trim() : fresh.notes,
+          },
+          tx
+        );
+
+        await auditService.logAction(
+          orgId,
+          undefined,
+          "FORMAL_RESERVATION_RELEASED",
+          fresh.referenceType,
+          fresh.referenceId,
+          "127.0.0.1",
+          "InventoryConcurrencyService",
+          `Reserva #${reservationId} liberada. ${fresh.quantity} un devolvidas ao saldo disponível. Motivo: ${reason || "Cancelamento"}`,
+          { reservationId, quantity: fresh.quantity },
+          { tx }
+        );
+
+        return updated!;
+      });
     } finally {
       releaseLock();
     }
@@ -993,45 +935,41 @@ export class InventoryConcurrencyService {
     ];
     const releaseLock = await this.lockManager.acquireLocks(lockKeys);
 
-    let balanceReleased = false;
-
     try {
-      // Re-verificar status sob lock
-      const fresh = await inventoryRepo.findReservationById(orgId, reservationId);
-      if (!fresh || fresh.status !== "ACTIVE") {
-        throw new Error(`Reserva #${reservationId} não está mais ativa (status atual: ${fresh?.status}).`);
-      }
-
-      await inventoryRepo.releaseReservation(orgId, fresh.productId, fresh.locationId, fresh.quantity);
-      balanceReleased = true;
-
-      const updated = await inventoryRepo.updateReservationStatus(orgId, reservationId, "CANCELED", {
-        releasedAt: new Date().toISOString(),
-        notes: reason ? `${fresh.notes || ""} [Cancelamento: ${reason}]`.trim() : fresh.notes,
-      });
-
-      await auditService.logAction(
-        orgId,
-        undefined,
-        "FORMAL_RESERVATION_CANCELED",
-        fresh.referenceType,
-        fresh.referenceId,
-        "127.0.0.1",
-        operatorName || "InventoryConcurrencyService",
-        `Reserva #${reservationId} cancelada. ${fresh.quantity} un devolvidas ao saldo disponível. Motivo: ${reason || "Cancelamento Solicitado"}`,
-        { reservationId, quantity: fresh.quantity, reason }
-      );
-
-      return updated!;
-    } catch (err: any) {
-      if (balanceReleased) {
-        try {
-          await inventoryRepo.reserveStock(orgId, reservation.productId, reservation.locationId, reservation.quantity);
-        } catch (rbErr) {
-          console.error(`[ROLLBACK_ERROR] Falha ao reverter cancelamento de reserva:`, rbErr);
+      return await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+        const fresh = await inventoryRepo.findReservationById(orgId, reservationId, tx);
+        if (!fresh || fresh.status !== "ACTIVE") {
+          throw new Error(`Reserva #${reservationId} não está mais ativa (status atual: ${fresh?.status}).`);
         }
-      }
-      throw err;
+
+        await inventoryRepo.releaseReservation(orgId, fresh.productId, fresh.locationId, fresh.quantity, tx);
+
+        const updated = await inventoryRepo.updateReservationStatus(
+          orgId,
+          reservationId,
+          "CANCELED",
+          {
+            releasedAt: new Date().toISOString(),
+            notes: reason ? `${fresh.notes || ""} [Cancelamento: ${reason}]`.trim() : fresh.notes,
+          },
+          tx
+        );
+
+        await auditService.logAction(
+          orgId,
+          undefined,
+          "FORMAL_RESERVATION_CANCELED",
+          fresh.referenceType,
+          fresh.referenceId,
+          "127.0.0.1",
+          operatorName || "InventoryConcurrencyService",
+          `Reserva #${reservationId} cancelada. ${fresh.quantity} un devolvidas ao saldo disponível. Motivo: ${reason || "Cancelamento Solicitado"}`,
+          { reservationId, quantity: fresh.quantity, reason },
+          { tx }
+        );
+
+        return updated!;
+      });
     } finally {
       releaseLock();
     }
@@ -1039,17 +977,11 @@ export class InventoryConcurrencyService {
 
   /**
    * Varredura Idempotente de Reservas Expiradas (Multi-Worker Proof)
-   * 
-   * Garante que entre múltiplos workers concorrentes:
-   * 1. Cada reserva expirada é transicionada ACTIVE -> EXPIRED apenas uma vez.
-   * 2. O saldo reservado (reserved_quantity) é decrementado apenas uma vez.
-   * 3. Retorna exclusivamente a lista de reservas que foram transicionadas nesta execução.
    */
   static async sweepExpiredReservations(orgId: string): Promise<InventoryReservationEntity[]> {
     const expiredProcessed: InventoryReservationEntity[] = [];
     const now = Date.now();
 
-    // 1. Identifica candidatas preliminares (ACTIVE e expiresAt <= now)
     const candidateIds: string[] = [];
     const activeReservations = await inventoryRepo.listReservations(orgId, { status: "ACTIVE" });
     for (const res of activeReservations) {
@@ -1058,7 +990,6 @@ export class InventoryConcurrencyService {
       }
     }
 
-    // 2. Processa cada reserva atomicamente com lock individual
     for (const resId of candidateIds) {
       const current = await inventoryRepo.findReservationById(orgId, resId);
       if (!current || current.status !== "ACTIVE") continue;
@@ -1070,38 +1001,44 @@ export class InventoryConcurrencyService {
 
       const releaseLock = await this.lockManager.acquireLocks(lockKeys);
       try {
-        // RE-FETCH FRESH UNDER LOCK: se outro worker já expirou ou confirmou, skip imediato
-        const fresh = await inventoryRepo.findReservationById(orgId, resId);
-        if (!fresh || fresh.status !== "ACTIVE") {
-          continue;
-        }
+        const updated = await UnitOfWork.transaction(orgId, async (tx: TransactionContext) => {
+          const fresh = await inventoryRepo.findReservationById(orgId, resId, tx);
+          if (!fresh || fresh.status !== "ACTIVE") {
+            return null;
+          }
 
-        // Se o prazo ainda não expirou de acordo com o relógio do momento do lock, skip
-        if (new Date(fresh.expiresAt).getTime() > Date.now()) {
-          continue;
-        }
+          if (new Date(fresh.expiresAt).getTime() > Date.now()) {
+            return null;
+          }
 
-        // Transiciona status para EXPIRED
-        const updated = await inventoryRepo.updateReservationStatus(orgId, resId, "EXPIRED", {
-          releasedAt: new Date().toISOString(),
-          notes: `${fresh.notes || ""} [Expirada automaticamente por TTL]`.trim(),
+          const resUpdated = await inventoryRepo.updateReservationStatus(
+            orgId,
+            resId,
+            "EXPIRED",
+            {
+              releasedAt: new Date().toISOString(),
+              notes: `${fresh.notes || ""} [Expirada automaticamente por TTL]`.trim(),
+            },
+            tx
+          );
+
+          await inventoryRepo.releaseReservation(orgId, fresh.productId, fresh.locationId, fresh.quantity, tx);
+
+          await auditService.logAction(
+            orgId,
+            undefined,
+            "RESERVATION_TTL_EXPIRED",
+            fresh.referenceType,
+            fresh.referenceId,
+            "127.0.0.1",
+            "SweepExpiredReservationsWorker",
+            `Reserva #${fresh.id} expirou por TTL. ${fresh.quantity} un desbloqueadas para venda.`,
+            { reservationId: fresh.id, quantity: fresh.quantity },
+            { tx }
+          );
+
+          return resUpdated;
         });
-
-        // Decrementa reserved_quantity exatamente UMA VEZ
-        await inventoryRepo.releaseReservation(orgId, fresh.productId, fresh.locationId, fresh.quantity);
-
-        // Registra auditoria
-        await auditService.logAction(
-          orgId,
-          undefined,
-          "RESERVATION_TTL_EXPIRED",
-          fresh.referenceType,
-          fresh.referenceId,
-          "127.0.0.1",
-          "SweepExpiredReservationsWorker",
-          `Reserva #${fresh.id} expirou por TTL. ${fresh.quantity} un desbloqueadas para venda.`,
-          { reservationId: fresh.id, quantity: fresh.quantity }
-        );
 
         if (updated) {
           expiredProcessed.push(updated);
@@ -1257,54 +1194,57 @@ export class InventoryConcurrencyService {
     const releaseLock = await this.lockManager.acquireLocks([lockKey]);
 
     try {
-      // 1. Grava no Ledger (Imutável)
-      const movementId = `mov-atom-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
-      const mov: InventoryMovementEntity = {
-        id: movementId,
-        organizationId,
-        productId,
-        locationId,
-        type: movementType,
-        quantityChange: quantityDelta,
-        physicalBalanceAfter: 0,
-        consignedBalanceAfter: 0,
-        onHandAfter: 0,
-        reservedAfter: 0,
-        availableAfter: 0,
-        referenceType,
-        referenceId,
-        operatorName: operatorName || "Operação Atômica Controlada",
-        notes: reason,
-        createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
-      };
+      return await UnitOfWork.transaction(organizationId, async (tx: TransactionContext) => {
+        // 1. Grava no Ledger (Imutável)
+        const movementId = `mov-atom-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
+        const mov: InventoryMovementEntity = {
+          id: movementId,
+          organizationId,
+          productId,
+          locationId,
+          type: movementType,
+          quantityChange: quantityDelta,
+          physicalBalanceAfter: 0,
+          consignedBalanceAfter: 0,
+          onHandAfter: 0,
+          reservedAfter: 0,
+          availableAfter: 0,
+          referenceType,
+          referenceId,
+          operatorName: operatorName || "Operação Atômica Controlada",
+          notes: reason,
+          createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+        };
 
-      await inventoryRepo.createMovement(mov);
+        await inventoryRepo.createMovement(mov, tx);
 
-      // 2. Atualiza Projeção (inventory_balances)
-      const balance = await inventoryRepo.adjustOnHand(organizationId, productId, locationId, quantityDelta);
+        // 2. Atualiza Projeção (inventory_balances)
+        const balance = await inventoryRepo.adjustOnHand(organizationId, productId, locationId, quantityDelta, tx);
 
-      // 3. Auditoria
-      await auditService.logAction(
-        organizationId,
-        userId,
-        "ATOMIC_ON_HAND_CHANGE",
-        referenceType,
-        referenceId,
-        "127.0.0.1",
-        "InventoryConcurrencyService",
-        `Ajuste on-hand de ${quantityDelta} un (${movementType}) efetuado com rastreabilidade completa. Motivo: ${reason}`,
-        { productId, locationId, quantityDelta, movementType }
-      );
+        // 3. Auditoria
+        await auditService.logAction(
+          organizationId,
+          userId,
+          "ATOMIC_ON_HAND_CHANGE",
+          referenceType,
+          referenceId,
+          "127.0.0.1",
+          "InventoryConcurrencyService",
+          `Ajuste on-hand de ${quantityDelta} un (${movementType}) efetuado com rastreabilidade completa. Motivo: ${reason}`,
+          { productId, locationId, quantityDelta, movementType },
+          { tx }
+        );
 
-      return {
-        success: true,
-        affectedRows: 1,
-        productId,
-        locationId,
-        quantityRequested: quantityDelta,
-        balance,
-        movement: mov,
-      };
+        return {
+          success: true,
+          affectedRows: 1,
+          productId,
+          locationId,
+          quantityRequested: quantityDelta,
+          balance,
+          movement: mov,
+        };
+      });
     } catch (err: any) {
       console.warn(`[ATOMIC_ON_HAND_FAILED] Falha ao ajustar estoque físico: ${err.message}`);
       return {

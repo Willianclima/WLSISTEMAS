@@ -226,15 +226,42 @@ export class IdempotencyService {
   }
 
   /**
-   * Sweeps expired idempotency keys from PostgreSQL
+   * Sweeps expired idempotency keys from PostgreSQL within explicit TenantContext.
    */
-  static async sweepExpired(): Promise<number> {
+  static async sweepExpired(organizationId?: string): Promise<number> {
     try {
-      const res = await query("DELETE FROM idempotency_keys WHERE expires_at <= NOW()");
-      return res.rowCount || 0;
+      if (organizationId) {
+        return await TenantContext.run({ tenantId: organizationId }, async () => {
+          const res = await query(
+            "DELETE FROM idempotency_keys WHERE organization_id = $1 AND expires_at <= NOW()",
+            [organizationId]
+          );
+          return res.rowCount || 0;
+        });
+      }
+
+      const orgsRes = await TenantContext.run({ isSuperAdmin: true }, async () => {
+        return await query("SELECT id FROM organizations");
+      });
+
+      let totalDeleted = 0;
+      for (const row of orgsRes.rows || []) {
+        const orgId = row.id;
+        if (!orgId) continue;
+        const deleted = await TenantContext.run({ tenantId: orgId }, async () => {
+          const res = await query(
+            "DELETE FROM idempotency_keys WHERE organization_id = $1 AND expires_at <= NOW()",
+            [orgId]
+          );
+          return res.rowCount || 0;
+        });
+        totalDeleted += deleted;
+      }
+      return totalDeleted;
     } catch (err: any) {
       console.error(`[IdempotencyService] Error sweeping expired keys:`, err.message);
       return 0;
     }
   }
 }
+

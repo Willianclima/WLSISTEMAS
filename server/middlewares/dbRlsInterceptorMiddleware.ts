@@ -1,45 +1,65 @@
 import { Response, NextFunction } from "express";
+import pg from "pg";
 import { AuthenticatedRequest } from "./authMiddleware";
 import { TenantContext } from "../db/tenantContext";
-import { setLocalTenantId, getPostgresPool, applyRlsContext } from "../db/postgres";
-import pg from "pg";
+import { executeWithTenantRlsContext, query, RlsContextError } from "../db/postgres";
 
 /**
  * Middleware e Interceptor de Banco de Dados para RLS (Row Level Security).
  *
- * Garante que em todas as conexões do banco de dados na requisição,
- * o comando:
- *    SET LOCAL app.current_tenant_id = '<tenant_id>'
- * seja executado antes de qualquer operação de leitura ou escrita,
- * impedindo fisicamente no PostgreSQL que uma organização acesse dados de outra.
+ * Anexa helpers transacionais com resolução tardia do contexto ativo (AsyncLocalStorage / req)
+ * delegando exclusivamente para executeWithTenantRlsContext e query() (set_config(..., true)),
+ * falhando de forma fechada quando nenhum contexto de tenant ou super admin estiver ativo.
  */
 export async function dbRlsInterceptorMiddleware(
   req: AuthenticatedRequest,
-  res: Response,
+  _res: Response,
   next: NextFunction
 ) {
-  const context = TenantContext.get();
-  const tenantId = context?.tenantId || req.organizationId;
-  const isSuperAdmin = Boolean(context?.isSuperAdmin || req.user?.isPlatformSuperAdmin);
+  const resolveRlsScope = () => {
+    const context = TenantContext.get();
+    const tenantId = context?.tenantId ?? req.organizationId ?? "";
+    const isSuperAdmin = Boolean(context?.isSuperAdmin || req.user?.isPlatformSuperAdmin);
+    if (!tenantId && !isSuperAdmin) {
+      throw new RlsContextError(
+        "Nenhum contexto de tenant ou super admin disponível para execução RLS.",
+        "RLS_TENANT_REQUIRED"
+      );
+    }
+    return { tenantId, isSuperAdmin };
+  };
 
-  if (tenantId) {
-    // Helper anexado à requisição para operações transacionais isoladas por RLS
-    (req as any).withTenantDb = async <T>(
+  if (!req.withTenantDb) {
+    req.withTenantDb = async <T>(
       callback: (client: pg.PoolClient) => Promise<T>
     ): Promise<T> => {
-      const client = await getPostgresPool().connect();
-      try {
-        await client.query("BEGIN");
-        await setLocalTenantId(client, tenantId, isSuperAdmin);
-        const result = await callback(client);
-        await client.query("COMMIT");
-        return result;
-      } catch (error) {
-        await client.query("ROLLBACK");
-        throw error;
-      } finally {
-        client.release();
-      }
+      const { tenantId, isSuperAdmin } = resolveRlsScope();
+      return await executeWithTenantRlsContext(tenantId, callback, isSuperAdmin);
+    };
+  }
+
+  if (!req.executeWithRls) {
+    req.executeWithRls = req.withTenantDb;
+  }
+
+  if (!req.scopedQuery) {
+    req.scopedQuery = async <T extends pg.QueryResultRow = any>(
+      sql: string,
+      params?: any[]
+    ): Promise<pg.QueryResult<T>> => {
+      const { tenantId, isSuperAdmin } = resolveRlsScope();
+      return await query<T>(sql, params, {
+        context: { tenantId, isSuperAdmin },
+      });
+    };
+  }
+
+  if (!req.db) {
+    req.db = {
+      query: <T extends pg.QueryResultRow = any>(sql: string, params?: any[]) =>
+        req.scopedQuery!<T>(sql, params),
+      withTransaction: <T>(callback: (client: pg.PoolClient) => Promise<T>) =>
+        req.withTenantDb!<T>(callback),
     };
   }
 
@@ -47,3 +67,4 @@ export async function dbRlsInterceptorMiddleware(
 }
 
 export { tenantRlsMiddleware } from "./tenantRlsMiddleware";
+

@@ -304,10 +304,6 @@ export class ProductService {
       org = await orgRepo.findBySlug(storeSlugOrOrgId);
     }
     if (!org) {
-      const all = await orgRepo.listAll();
-      org = all[0] || null;
-    }
-    if (!org) {
       throw new Error(`Loja / Catálogo "${storeSlugOrOrgId}" não encontrado.`);
     }
 

@@ -10,7 +10,7 @@ import {
 } from "../repositories";
 import { inventoryRepo } from "../modules/inventory/inventory.repository";
 import { TenantContext } from "../db/tenantContext";
-import { query, withTransaction } from "../db/postgres";
+import { setLocalTenantId, withTransaction } from "../db/postgres";
 import {
   UserEntity,
   OrganizationEntity,
@@ -162,6 +162,16 @@ export class AuthService {
       updatedAt: now.toISOString().replace("T", " ").substring(0, 16),
     };
 
+    const plan = await planRepo.findById("TRIAL_30D");
+    const allowedModules = plan?.allowedModules || [
+      "CATALOG",
+      "INVENTORY",
+      "ORDERS",
+      "CUSTOMERS",
+      "FINANCIAL",
+      "INTEGRATIONS",
+    ];
+
     // 3. Atomic Transactional Persistence: User + Org + Member + Subscription + Modules + Location
     await withTransaction(async (client) => {
       await client.query(
@@ -189,6 +199,8 @@ export class AuthService {
           organization.status,
         ]
       );
+
+      await setLocalTenantId(client, organization.id, false);
 
       await client.query(
         `INSERT INTO organization_members (id, organization_id, user_id, role, custom_permissions, status, created_at)
@@ -220,18 +232,9 @@ export class AuthService {
         ]
       );
 
-      const plan = await planRepo.findById("TRIAL_30D");
-      const allowedModules = plan?.allowedModules || [
-        "CATALOG",
-        "INVENTORY",
-        "ORDERS",
-        "CUSTOMERS",
-        "FINANCIAL",
-        "INTEGRATIONS",
-      ];
       for (const modKey of allowedModules) {
         await client.query(
-          `INSERT INTO organization_modules (id, organization_id, module_key, is_enabled, created_at)
+          `INSERT INTO organization_modules (id, organization_id, module_key, is_enabled, activated_at)
            VALUES ($1, $2, $3, $4, NOW())
            ON CONFLICT (organization_id, module_key) DO UPDATE SET is_enabled = EXCLUDED.is_enabled`,
           [`mod-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`, organization.id, modKey, true]
@@ -357,39 +360,46 @@ export class AuthService {
           await orgRepo.create(masterOrg);
         }
 
-        const memId = `mem-master-${user.id}`;
-        let mem = await memberRepo.findById(memId);
-        if (!mem) {
-          mem = {
-            id: memId,
-            organizationId: masterOrg.id,
-            userId: user.id,
-            role: "OWNER",
-            customPermissions: ["*"],
-            status: "ACTIVE",
-            createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
-          };
-          await memberRepo.create(mem);
-        }
+        const { mem, sub } = await TenantContext.run(
+          { tenantId: masterOrg.id, isSuperAdmin: true },
+          async () => {
+            const memId = `mem-master-${user.id}`;
+            let resolvedMem = await memberRepo.findById(memId, masterOrg!.id);
+            if (!resolvedMem) {
+              resolvedMem = {
+                id: memId,
+                organizationId: masterOrg!.id,
+                userId: user.id,
+                role: "OWNER",
+                customPermissions: ["*"],
+                status: "ACTIVE",
+                createdAt: new Date().toISOString().replace("T", " ").substring(0, 16),
+              };
+              await memberRepo.create(resolvedMem);
+            }
 
-        let sub = await subRepo.findByOrgId(masterOrg.id);
-        if (!sub) {
-          const now = new Date();
-          sub = {
-            id: `sub-master-${masterOrg.id}`,
-            organizationId: masterOrg.id,
-            planId: "ENTERPRISE" as SaaSPlanId,
-            status: "ACTIVE",
-            trialStartedAt: now.toISOString().replace("T", " ").substring(0, 16),
-            trialEndsAt: now.toISOString().replace("T", " ").substring(0, 16),
-            currentPeriodStart: now.toISOString().replace("T", " ").substring(0, 16),
-            currentPeriodEnd: new Date(now.getTime() + 365 * 86400000).toISOString().replace("T", " ").substring(0, 16),
-            autoRenew: true,
-            createdAt: now.toISOString().replace("T", " ").substring(0, 16),
-            updatedAt: now.toISOString().replace("T", " ").substring(0, 16),
-          };
-          await subRepo.create(sub);
-        }
+            let resolvedSub = await subRepo.findByOrgId(masterOrg!.id);
+            if (!resolvedSub) {
+              const now = new Date();
+              resolvedSub = {
+                id: `sub-master-${masterOrg!.id}`,
+                organizationId: masterOrg!.id,
+                planId: "ENTERPRISE" as SaaSPlanId,
+                status: "ACTIVE",
+                trialStartedAt: now.toISOString().replace("T", " ").substring(0, 16),
+                trialEndsAt: now.toISOString().replace("T", " ").substring(0, 16),
+                currentPeriodStart: now.toISOString().replace("T", " ").substring(0, 16),
+                currentPeriodEnd: new Date(now.getTime() + 365 * 86400000).toISOString().replace("T", " ").substring(0, 16),
+                autoRenew: true,
+                createdAt: now.toISOString().replace("T", " ").substring(0, 16),
+                updatedAt: now.toISOString().replace("T", " ").substring(0, 16),
+              };
+              await subRepo.create(resolvedSub);
+            }
+
+            return { mem: resolvedMem, sub: resolvedSub };
+          }
+        );
 
         return this.buildAuthSession(user, masterOrg, mem, sub);
       }
@@ -416,26 +426,32 @@ export class AuthService {
     if (!organization || organization.status !== "ACTIVE") {
       throw new Error("Organização vinculada não encontrada ou inativa.");
     }
-    let subscription = await subRepo.findByOrgId(organization.id);
 
-    if (!subscription) {
-      const now = new Date();
-      const trialEnd = new Date(now.getTime() + 30 * 86400000);
-      subscription = {
-        id: `sub-default-${organization.id}`,
-        organizationId: organization.id,
-        planId: "TRIAL_30D" as SaaSPlanId,
-        status: "TRIALING",
-        trialStartedAt: now.toISOString().replace("T", " ").substring(0, 16),
-        trialEndsAt: trialEnd.toISOString().replace("T", " ").substring(0, 16),
-        currentPeriodStart: now.toISOString().replace("T", " ").substring(0, 16),
-        currentPeriodEnd: trialEnd.toISOString().replace("T", " ").substring(0, 16),
-        autoRenew: true,
-        createdAt: now.toISOString().replace("T", " ").substring(0, 16),
-        updatedAt: now.toISOString().replace("T", " ").substring(0, 16),
-      };
-      await subRepo.create(subscription);
-    }
+    const subscription = await TenantContext.run(
+      { tenantId: organization.id, isSuperAdmin: Boolean(user.isPlatformSuperAdmin) },
+      async () => {
+        let sub = await subRepo.findByOrgId(organization.id);
+        if (!sub) {
+          const now = new Date();
+          const trialEnd = new Date(now.getTime() + 30 * 86400000);
+          sub = {
+            id: `sub-default-${organization.id}`,
+            organizationId: organization.id,
+            planId: "TRIAL_30D" as SaaSPlanId,
+            status: "TRIALING",
+            trialStartedAt: now.toISOString().replace("T", " ").substring(0, 16),
+            trialEndsAt: trialEnd.toISOString().replace("T", " ").substring(0, 16),
+            currentPeriodStart: now.toISOString().replace("T", " ").substring(0, 16),
+            currentPeriodEnd: trialEnd.toISOString().replace("T", " ").substring(0, 16),
+            autoRenew: true,
+            createdAt: now.toISOString().replace("T", " ").substring(0, 16),
+            updatedAt: now.toISOString().replace("T", " ").substring(0, 16),
+          };
+          await subRepo.create(sub);
+        }
+        return sub;
+      }
+    );
 
     return this.buildAuthSession(user, organization, selectedMembership, subscription);
   }
@@ -579,19 +595,19 @@ export class AuthService {
         const passwordHash = await this.hashPassword(data.password);
 
         // 3. Ensure master organization exists
-        const orgRes = await client.query("SELECT id, name, slug FROM organizations LIMIT 1");
-        let masterOrgId = orgRes.rows[0]?.id;
-        let masterOrgSlug = orgRes.rows[0]?.slug;
-        let masterOrgName = orgRes.rows[0]?.name;
+        const orgRes = await client.query("SELECT * FROM organizations LIMIT 1");
+        let masterOrgRow = orgRes.rows[0];
+        let masterOrgId = masterOrgRow?.id;
 
         if (!masterOrgId) {
           masterOrgId = `org-aura-${Date.now()}`;
-          masterOrgSlug = "aura-plataforma";
-          masterOrgName = data.ecosystemName?.trim() || "AURA Plataforma & Ecossistema";
-          await client.query(
+          const masterOrgSlug = "aura-plataforma";
+          const masterOrgName = data.ecosystemName?.trim() || "AURA Plataforma & Ecossistema";
+          const insertedOrg = await client.query(
             `INSERT INTO organizations (
               id, name, slug, document, segment, city, state, contact_email, contact_whatsapp, status, created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ACTIVE', NOW(), NOW())`,
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'ACTIVE', NOW(), NOW())
+            RETURNING *`,
             [
               masterOrgId,
               masterOrgName,
@@ -604,14 +620,19 @@ export class AuthService {
               data.phone || "",
             ]
           );
+          masterOrgRow = insertedOrg.rows[0];
         }
+
+        // Bind transaction-local RLS context before writing tenant-scoped tables
+        await setLocalTenantId(client, masterOrgId, true);
 
         // 4. Create the first user as Platform Super Admin
         const userId = `usr-master-${Date.now()}`;
-        await client.query(
+        const insertedUser = await client.query(
           `INSERT INTO users (
             id, name, email, password_hash, phone, is_platform_super_admin, status, created_at, last_login_at
-          ) VALUES ($1, $2, $3, $4, $5, true, 'ACTIVE', NOW(), NOW())`,
+          ) VALUES ($1, $2, $3, $4, $5, true, 'ACTIVE', NOW(), NOW())
+          RETURNING *`,
           [
             userId,
             data.name.trim(),
@@ -623,10 +644,11 @@ export class AuthService {
 
         // 5. Create root membership with OWNER role and full wildcard permissions
         const memId = `mem-master-${Date.now()}`;
-        await client.query(
+        const insertedMem = await client.query(
           `INSERT INTO organization_members (
             id, organization_id, user_id, role, custom_permissions, status, created_at
-          ) VALUES ($1, $2, $3, 'OWNER', $4, 'ACTIVE', NOW())`,
+          ) VALUES ($1, $2, $3, 'OWNER', $4, 'ACTIVE', NOW())
+          RETURNING *`,
           [
             memId,
             masterOrgId,
@@ -636,23 +658,136 @@ export class AuthService {
         );
 
         // 6. Ensure master subscription
-        const subCheck = await client.query("SELECT id FROM subscriptions WHERE organization_id = $1", [masterOrgId]);
-        if (subCheck.rows.length === 0) {
-          await client.query(
+        const subCheck = await client.query("SELECT * FROM subscriptions WHERE organization_id = $1", [masterOrgId]);
+        let subRow = subCheck.rows[0];
+        if (!subRow) {
+          const insertedSub = await client.query(
             `INSERT INTO subscriptions (
               id, organization_id, plan_id, status, trial_started_at, trial_ends_at, current_period_start, current_period_end, auto_renew, created_at, updated_at
-            ) VALUES ($1, $2, 'ENTERPRISE', 'ACTIVE', NOW(), NOW() + INTERVAL '365 days', NOW(), NOW() + INTERVAL '365 days', true, NOW(), NOW())`,
+            ) VALUES ($1, $2, 'ENTERPRISE', 'ACTIVE', NOW(), NOW() + INTERVAL '365 days', NOW(), NOW() + INTERVAL '365 days', true, NOW(), NOW())
+            RETURNING *`,
             [
               `sub-master-${masterOrgId}`,
               masterOrgId,
             ]
           );
+          subRow = insertedSub.rows[0];
         }
 
-        const masterUser = (await userRepo.findById(userId))!;
-        const masterOrg = (await orgRepo.findById(masterOrgId))!;
-        const membership = (await memberRepo.findById(memId))!;
-        const subscription = (await subRepo.findByOrgId(masterOrgId))!;
+        const uRow = insertedUser.rows[0];
+        const mRow = insertedMem.rows[0];
+        const nowStr = new Date().toISOString().replace("T", " ").substring(0, 16);
+
+        const masterUser: UserEntity = uRow
+          ? {
+              id: uRow.id,
+              name: uRow.name,
+              email: uRow.email,
+              passwordHash: uRow.password_hash,
+              avatarUrl: uRow.avatar_url || undefined,
+              phone: uRow.phone || undefined,
+              isPlatformSuperAdmin: Boolean(uRow.is_platform_super_admin),
+              status: uRow.status,
+              createdAt: uRow.created_at instanceof Date ? uRow.created_at.toISOString() : String(uRow.created_at),
+              lastLoginAt: uRow.last_login_at instanceof Date ? uRow.last_login_at.toISOString() : (uRow.last_login_at ? String(uRow.last_login_at) : nowStr),
+            }
+          : {
+              id: userId,
+              name: data.name.trim(),
+              email: emailNormalized,
+              passwordHash,
+              phone: data.phone || "",
+              isPlatformSuperAdmin: true,
+              status: "ACTIVE",
+              createdAt: nowStr,
+              lastLoginAt: nowStr,
+            };
+
+        const masterOrg: OrganizationEntity = masterOrgRow
+          ? {
+              id: masterOrgRow.id,
+              name: masterOrgRow.name,
+              slug: masterOrgRow.slug,
+              document: masterOrgRow.document,
+              segment: masterOrgRow.segment,
+              logoUrl: masterOrgRow.logo_url || undefined,
+              city: masterOrgRow.city,
+              state: masterOrgRow.state,
+              contactEmail: masterOrgRow.contact_email,
+              contactWhatsapp: masterOrgRow.contact_whatsapp,
+              customDomain: masterOrgRow.custom_domain || undefined,
+              customDomainStatus: masterOrgRow.custom_domain_status || undefined,
+              status: masterOrgRow.status,
+              createdAt: masterOrgRow.created_at instanceof Date ? masterOrgRow.created_at.toISOString() : String(masterOrgRow.created_at),
+              updatedAt: masterOrgRow.updated_at instanceof Date ? masterOrgRow.updated_at.toISOString() : String(masterOrgRow.updated_at),
+            }
+          : {
+              id: masterOrgId,
+              name: data.ecosystemName?.trim() || "AURA Plataforma & Ecossistema",
+              slug: "aura-plataforma",
+              document: "00.000.000/0001-00",
+              segment: "SEMIJOIAS",
+              city: "Limeira",
+              state: "SP",
+              contactEmail: emailNormalized,
+              contactWhatsapp: data.phone || "",
+              status: "ACTIVE",
+              createdAt: nowStr,
+              updatedAt: nowStr,
+            };
+
+        const membership: OrganizationMemberEntity = mRow
+          ? {
+              id: mRow.id,
+              organizationId: mRow.organization_id,
+              userId: mRow.user_id,
+              role: mRow.role,
+              customPermissions: Array.isArray(mRow.custom_permissions)
+                ? mRow.custom_permissions
+                : typeof mRow.custom_permissions === "string"
+                ? JSON.parse(mRow.custom_permissions)
+                : ["*"],
+              status: mRow.status,
+              createdAt: mRow.created_at instanceof Date ? mRow.created_at.toISOString() : String(mRow.created_at),
+            }
+          : {
+              id: memId,
+              organizationId: masterOrgId,
+              userId,
+              role: "OWNER",
+              customPermissions: ["*"],
+              status: "ACTIVE",
+              createdAt: nowStr,
+            };
+
+        const subscription: SubscriptionEntity = subRow
+          ? {
+              id: subRow.id,
+              organizationId: subRow.organization_id,
+              planId: subRow.plan_id,
+              status: subRow.status,
+              trialStartedAt: subRow.trial_started_at instanceof Date ? subRow.trial_started_at.toISOString() : String(subRow.trial_started_at),
+              trialEndsAt: subRow.trial_ends_at instanceof Date ? subRow.trial_ends_at.toISOString() : String(subRow.trial_ends_at),
+              currentPeriodStart: subRow.current_period_start instanceof Date ? subRow.current_period_start.toISOString() : String(subRow.current_period_start),
+              currentPeriodEnd: subRow.current_period_end instanceof Date ? subRow.current_period_end.toISOString() : String(subRow.current_period_end),
+              paymentMethod: subRow.payment_method,
+              autoRenew: Boolean(subRow.auto_renew),
+              createdAt: subRow.created_at instanceof Date ? subRow.created_at.toISOString() : String(subRow.created_at),
+              updatedAt: subRow.updated_at instanceof Date ? subRow.updated_at.toISOString() : String(subRow.updated_at),
+            }
+          : {
+              id: `sub-master-${masterOrgId}`,
+              organizationId: masterOrgId,
+              planId: "ENTERPRISE",
+              status: "ACTIVE",
+              trialStartedAt: nowStr,
+              trialEndsAt: nowStr,
+              currentPeriodStart: nowStr,
+              currentPeriodEnd: nowStr,
+              autoRenew: true,
+              createdAt: nowStr,
+              updatedAt: nowStr,
+            };
 
         return this.buildAuthSession(masterUser, masterOrg, membership, subscription);
       });
